@@ -74,6 +74,8 @@ export async function providerLoginEnvironment(
     providerId: string;
     threadId?: string;
     projectId?: string;
+    requestId?: string;
+    runningTurnRequestId?: string;
   },
 ): Promise<HostDaemonContributedEnvEntry[]> {
   const { providerId, ...pluginContext } = context;

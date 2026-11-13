@@ -171,6 +171,14 @@ bb.providers.experimental_contributeEnv("claude-code", async (context) => [
 The server calls the resolver for every matching start, resume, fork, and turn
 command. Its `ExperimentalPluginProviderEnvContext` has `threadId`, `projectId`,
 and `hostId`; return at most 32 `ExperimentalPluginProviderEnvEntry` values.
+A turn command whose request id is already known also passes `requestId` (the
+id a later `turn.failed` names). A steer, or an "auto" send (such as a child's
+report) aimed at the running turn, also passes `runningTurnRequestId`, a
+request the turn it joins already accepted: that turn keeps the environment it
+started with. If the turn ended before the command landed, a new turn starts on
+the environment you returned, so the two ids can differ in login when the
+thread's account changed mid-turn. Both are optional: treat a missing
+`requestId` as a command you cannot tie to a turn.
 It also calls the resolver with only `hostId` for helper calls, such as thread
 naming, so they run on the same login as the provider's threads.
 Names must match `[A-Z_][A-Z0-9_]*`; `reason` is required. A

@@ -32,9 +32,11 @@ import {
 } from "./src/cursor.js";
 import {
   ACCOUNTS_CHANGED,
+  CODEX_ACCOUNT_ENV,
   LOCAL,
   MAX_ACCOUNTS,
   accountsRpcContract,
+  pendingPinSchema,
   providerSchema,
   usageWindowSchema,
   type AccountView,
@@ -184,6 +186,27 @@ export default async function plugin(room: BbPluginApi) {
   const localName = (provider: Provider, login: string | null) =>
     login === null ? null : (localNames[`${provider} ${login}`] ?? null);
   const saveLocalNames = () => kv.set("local-names:v1", localNames);
+  // Accounts pinned to one thread or a whole project, per agent: `pins.thread[threadId][provider]` is an account id.
+  // A thread's pin beats its project's, and either beats the default (the top account). Local threads only.
+  const pinsSchema = z.record(z.string(), z.record(z.string(), z.string())).catch({});
+  const pins = z
+    .object({ thread: pinsSchema, project: pinsSchema })
+    .catch({ thread: {}, project: {} })
+    .parse(await kv.get("pins:v1"));
+  const savePins = () => kv.set("pins:v1", pins);
+  // Drops this agent's pins to the accounts `gone` names; true when any went.
+  const dropPins = (provider: Provider, gone: (id: string) => boolean) => {
+    let dropped = false;
+    for (const scope of [pins.thread, pins.project])
+      for (const key of Object.keys(scope)) {
+        const id = scope[key]?.[provider];
+        if (id === undefined || !gone(id)) continue;
+        dropped = true;
+        delete scope[key]![provider];
+        if (Object.keys(scope[key]!).length === 0) delete scope[key];
+      }
+    return dropped;
+  };
   let inCloud = z.string().nullable().catch(null).parse(await kv.get("cloud:v1"));
   // The Mac's own Claude login, and the organization of the one-year token Cloud uses for it.
   let mac: MacClaude | null = (await localClaudeAccount()) ?? null;
@@ -244,39 +267,58 @@ export default async function plugin(room: BbPluginApi) {
         ),
       ),
     );
-  const threadAccount = new Map<string, string>();
-  // A helper call, such as thread naming, uses the account in use but has no thread to note.
-  const noteThreadAccount = (threadId: string | undefined, account: string) => {
-    if (threadId !== undefined) threadAccount.set(threadId, account);
-  };
-  // A message that joins a running turn asks for the env again, but that turn keeps the Claude it began on until it
-  // ends. Only a new turn notes its thread, so a late limit stays the old account's (#1300).
-  const newTurn = async (threadId: string | undefined) => {
-    try {
-      if (
-        threadId &&
-        (await room.sdk.threads.get({ threadId })).status === "active"
-      )
-        return undefined;
-    } catch {}
-    return threadId;
-  };
-  // Claude account folders exist only on this computer. A thread on another machine (SSH, manual, another Mac) that
-  // gets no account runs on that machine's own login (claude-code scope), so its limits are no account's here (#531).
-  const ownLogin = new Set<string>();
-  const noteOwnLogin = (threadId: string | undefined, own: boolean) => {
+  // What each turn this computer launched ran on, by thread and request id (the ids `turn.failed` and `thread.idle`
+  // name). Only a launch whose env this plugin handed out is known: `account` is the account its credentials came from,
+  // `own` a machine's own login (another machine with no account here, #531), and neither an unknown login. `at` is
+  // when it launched. Cloud turns and turns from before a restart have none. Never holds credentials.
+  type Launch = { provider: Provider; account?: string; own: boolean; at: number };
+  // Request ids are a thread's own: two threads may share one. The newest few hundred are plenty to outlast a turn.
+  const launches = new Map<string, Launch>();
+  const LAUNCHES_KEPT = 256;
+  const launchKey = (threadId: string, requestId: string) => `${threadId}\n${requestId}`;
+  // What each thread's provider runs on now: its latest launch, request id or not. A turn whose command carried none
+  // (retries made inside a transaction, "auto" sends that name no running turn) ran on what it was handed, and one an "auto" send joined
+  // keeps what it began on, so a limit on a request this plugin never saw is put here. Only a limit: a turn of unknown
+  // start never clears one.
+  const lastLaunch = new Map<string, Launch>();
+  // A provider env resolution: a new turn notes its own launch. A steer (or an "auto" send aimed at the running turn)
+  // asks for the env again, but the turn it joins keeps the login it began on, so its request is that turn's (#1300).
+  const noteRequest = async (
+    context: { threadId?: string; requestId?: string; runningTurnRequestId?: string },
+    launch: Omit<Launch, "at">,
+  ) => {
+    const { threadId, requestId, runningTurnRequestId } = context;
     if (threadId === undefined) return;
-    if (own) ownLogin.add(threadId);
-    else ownLogin.delete(threadId);
+    // A command with no request id that finds its thread running joins that turn, which keeps its login (#1300).
+    if (requestId === undefined) {
+      try {
+        if ((await room.sdk.threads.get({ threadId })).status === "active") return;
+      } catch {}
+    }
+    // A steer whose running request this plugin never saw (one an "auto" send joined without an id) still joins the
+    // turn the thread last launched on this agent: it keeps that, and so does its own request. Unknown with neither.
+    const latest = lastLaunch.get(threadId);
+    const noted =
+      runningTurnRequestId === undefined
+        ? { ...launch, at: Date.now() }
+        : (launches.get(launchKey(threadId, runningTurnRequestId)) ??
+          (latest?.provider === launch.provider ? latest : undefined));
+    if (!noted) return;
+    lastLaunch.delete(threadId);
+    lastLaunch.set(threadId, noted);
+    for (const oldest of lastLaunch.keys()) {
+      if (lastLaunch.size <= LAUNCHES_KEPT) break;
+      lastLaunch.delete(oldest);
+    }
+    if (requestId === undefined) return;
+    const key = launchKey(threadId, requestId);
+    launches.delete(key);
+    launches.set(key, noted);
+    for (const oldest of launches.keys()) {
+      if (launches.size <= LAUNCHES_KEPT) break;
+      launches.delete(oldest);
+    }
   };
-  // Teleport keeps the thread: in Cloud it runs on the selected account again. A harness switch leaves Claude.
-  const onOwnLogin = (
-    thread: { id: string; providerId: string; executionTarget?: string } | null,
-  ) =>
-    thread !== null &&
-    thread.providerId === "claude-code" &&
-    thread.executionTarget !== "cloud" &&
-    ownLogin.has(thread.id);
   let thisComputer: Promise<string | null> | undefined;
   const onAnotherMachine = async (hostId: string | undefined) => {
     thisComputer ??= room.sdk.system.config().then(
@@ -286,9 +328,8 @@ export default async function plugin(room: BbPluginApi) {
     const id = await thisComputer;
     return !!hostId && id !== null && hostId !== id;
   };
-  // When each limit was noted and each running turn began, since this start. They tell a limit that has lifted.
+  // When each limit was noted, since this start. It tells a limit that has lifted.
   const limitedAt = new Map<string, number>();
-  const turnBegan = new Map<string, number>();
   const claudeLogin = new ClaudeLogin(path.dirname(secretsDir), () =>
     room.server.experimental_claudeSetupToken?.(),
   );
@@ -301,6 +342,8 @@ export default async function plugin(room: BbPluginApi) {
     );
   let codexInUse = LOCAL;
   let codexAccounts = 0;
+  // The account ids on the website's last list (none when signed out). Unset until the first list.
+  let codexKnown: Set<string> | undefined;
 
   // `connect` marks the user adding, picking, or moving an account, which connects Claude again (ADR 0327).
   const changed = async (connect = false) => {
@@ -351,9 +394,32 @@ export default async function plugin(room: BbPluginApi) {
       order[provider] = order[provider].filter((id) => id !== LOCAL);
     return order[provider];
   };
+  // The account Cloud runs this agent on: the one it last confirmed, and for Codex the website's selected account.
+  const inCloudFor = (provider: Provider): string | undefined =>
+    (provider === "claude-code"
+      ? inCloud
+      : provider === "acp-cursor"
+        ? cursorInCloud
+        : codexInUse) || undefined;
   // The top account is the one every thread uses (ADR 0197).
   const current = (provider: Provider): string =>
     provider === "codex" ? codexInUse : (ids(provider)[0] ?? LOCAL);
+  // A pin to a removed account, or to a Mac login that is signed out or hidden (added as an account, so the picker
+  // can't show it), falls back to the default. Codex accounts live on the website: each list drops pins to accounts it
+  // no longer has (codexView).
+  const usable = (provider: Provider, id: string) =>
+    provider === "codex" ||
+    (id === LOCAL
+      ? provider !== "claude-code" || (mac !== null && ids(provider).includes(LOCAL))
+      : accounts.some((entry) => entry.provider === provider && entry.id === id));
+  const pinned = (provider: Provider, threadId?: string, projectId?: string) =>
+    [
+      threadId === undefined ? undefined : pins.thread[threadId]?.[provider],
+      projectId === undefined ? undefined : pins.project[projectId]?.[provider],
+    ].find((id): id is string => id !== undefined && usable(provider, id));
+  // The account a Local thread's next turn runs on.
+  const accountFor = (provider: Provider, threadId?: string, projectId?: string) =>
+    pinned(provider, threadId, projectId) ?? current(provider);
   const limitedUntil = (provider: Provider, id: string): number | null => {
     const until = limits[`${provider}:${id}`];
     return until !== undefined && until > Date.now() ? until : null;
@@ -408,11 +474,34 @@ export default async function plugin(room: BbPluginApi) {
     "claude-code": current("claude-code"),
     "acp-cursor": current("acp-cursor"),
   };
+  // A thread a limit stopped that this plugin may continue: still here, Local (Core continues Cloud threads, ADR 0117),
+  // and still on the agent whose limit stopped it.
+  const waitingHere = async (
+    provider: Provider,
+    threadId: string,
+    known?: Awaited<ReturnType<typeof room.sdk.threads.get>>,
+  ) => {
+    const thread =
+      known?.id === threadId
+        ? known
+        : await room.sdk.threads.get({ threadId }).catch(() => null);
+    return thread &&
+      thread.executionTarget !== "cloud" &&
+      thread.providerId === provider
+      ? thread
+      : null;
+  };
   const noteInUse = async (provider: Provider, id: string) => {
     const before = inUse[provider];
     inUse[provider] = id;
-    if (before !== undefined && before !== id)
-      await limited.switched(provider, id);
+    if (before === undefined || before === id) return;
+    // A pinned Local thread keeps its account whatever the default becomes: it waits for the reset or a new pin.
+    await limited.resumeEach(provider, async (threadId) => {
+      const thread = await waitingHere(provider, threadId);
+      return thread && pinned(provider, thread.id, thread.projectId) === undefined
+        ? id
+        : undefined;
+    });
   };
   let codexResumed: Promise<void> = Promise.resolve();
 
@@ -749,6 +838,12 @@ export default async function plugin(room: BbPluginApi) {
     const selected = list.accounts.find((account) => account.inUse);
     codexInUse = selected?.id ?? LOCAL;
     codexAccounts = list.accounts.length;
+    codexKnown = new Set(list.accounts.map((account) => account.id));
+    // Accounts removed on the website or another computer lose their pins here, on a signed-in list: a pin until then
+    // stays (signed out lists none), and the app falls back to the selected account for an id it no longer has.
+    const known = new Set(list.accounts.map((account) => account.id));
+    if (list.signedIn && dropPins("codex", (id) => id !== LOCAL && !known.has(id)))
+      await savePins();
     codexResumed = noteInUse("codex", codexInUse);
     background(refreshCodexLocal());
     const email = await localCodexEmail();
@@ -905,10 +1000,14 @@ export default async function plugin(room: BbPluginApi) {
     if (provider === "codex") {
       await codex({ action: "remove", id });
       await kv.set("limits:v1", limits);
+      dropPins(provider, (pin) => pin === id);
+      await savePins();
       return;
     }
     const removed = accounts.find((account) => account.id === id);
     accounts = accounts.filter((account) => account.id !== id);
+    dropPins(provider, (pin) => pin === id);
+    await savePins();
     if (removed?.profile) void dropProfile(removed.profile);
     order[provider] = order[provider].filter((entry) => entry !== id);
     usage.delete(id);
@@ -922,12 +1021,56 @@ export default async function plugin(room: BbPluginApi) {
     await changed();
   };
 
+  const label = (view: AccountView) =>
+    view.name ?? view.email ?? (view.id === LOCAL ? `This ${COMPUTER_TITLE}` : "Account");
+  // Sets or clears (null) a pin. A thread a plan limit stopped continues at once on its new account.
+  const pin = async (
+    target: { threadId: string; projectId: string },
+    provider: Provider,
+    scope: "thread" | "project",
+    id: string | null,
+  ) => {
+    const key = scope === "thread" ? target.threadId : target.projectId;
+    const set = (pins[scope][key] ??= {});
+    if (id === null) delete set[provider];
+    else set[provider] = id;
+    if (Object.keys(set).length === 0) delete pins[scope][key];
+    await savePins();
+    room.realtime.publish(ACCOUNTS_CHANGED, {});
+    // Every Local thread the pin covers continues on the account it now names: the thread, or each one in the project.
+    await limited.resumeEach(provider, async (waitingId) => {
+      if (scope === "thread" && waitingId !== target.threadId) return undefined;
+      const waiting = await waitingHere(provider, waitingId);
+      return waiting && waiting.projectId === target.projectId
+        ? accountFor(provider, waiting.id, waiting.projectId)
+        : undefined;
+    });
+  };
+
   room.rpc.register(
     accountsRpcContract,
     {
       "accounts.list": ({ provider }) => views(provider),
       "accounts.use": async ({ provider, id, cloud, threadId }) => {
+        const picked = threadId
+          ? await room.sdk.threads.get({ threadId }).catch(() => null)
+          : null;
+        const local = picked !== null && picked.executionTarget !== "cloud";
+        // A Local thread already on this account: nothing switches, and a limit noted on it stays.
+        if (local && accountFor(provider, picked.id, picked.projectId) === id) return null;
         delete limits[`${provider}:${id}`];
+        // Picked from a pinned thread: only that thread moves, and it stays on the account picked.
+        if (local && pinned(provider, picked.id, picked.projectId) !== undefined) {
+          if (limited.account(picked.id) === undefined)
+            await limited.record(
+              picked.id,
+              provider,
+              accountFor(provider, picked.id, picked.projectId),
+            );
+          await kv.set("limits:v1", limits);
+          await pin({ threadId: picked.id, projectId: picked.projectId }, provider, "thread", id);
+          return null;
+        }
         // The thread it was picked from continues too: the user asked, even after a Stop or a limit this plugin
         // never noted.
         if (threadId)
@@ -1062,6 +1205,41 @@ export default async function plugin(room: BbPluginApi) {
         await changed();
         return null;
       },
+      "accounts.thread": async (input) => {
+        // A new thread's composer names its project and agent: there is no thread yet.
+        const thread =
+          "threadId" in input
+            ? await room.sdk.threads.get({ threadId: input.threadId }).catch(() => null)
+            : { id: null, projectId: input.projectId, providerId: input.provider, executionTarget: "local" };
+        const provider = providerSchema.safeParse(thread?.providerId);
+        if (!thread || !provider.success) return null;
+        const list = await views(provider.data);
+        const own = (id: string | undefined) =>
+          id !== undefined && list.some((view) => view.id === id) ? id : null;
+        return {
+          provider: provider.data,
+          accounts: list.map((view) => ({ id: view.id, label: label(view) })),
+          default: current(provider.data),
+          thread: thread.id === null ? null : own(pins.thread[thread.id]?.[provider.data]),
+          project: own(pins.project[thread.projectId]?.[provider.data]),
+          cloud: thread.executionTarget === "cloud",
+        };
+      },
+      "accounts.pin": async (input) => {
+        const target =
+          "threadId" in input
+            ? await room.sdk.threads.get({ threadId: input.threadId }).then((thread) => ({
+                threadId: thread.id,
+                projectId: thread.projectId,
+                providerId: thread.providerId,
+              }))
+            : { threadId: "", projectId: input.projectId, providerId: input.provider };
+        const provider = providerSchema.parse(target.providerId);
+        if (input.id !== null && !(await views(provider)).some((view) => view.id === input.id))
+          throw new Error("That account is gone. Pick another one.");
+        await pin(target, provider, input.scope, input.id);
+        return null;
+      },
       "claude.start": async (input) => {
         // The Mac's own login already runs Local threads: Cloud only needs its one-year token.
         if (input?.mac) {
@@ -1163,24 +1341,56 @@ export default async function plugin(room: BbPluginApi) {
     },
   );
 
+  // A new thread's own pick ("This thread" in its composer) arrives with its first message. Pinned here, before that
+  // message's turn starts, so the first turn already runs on it.
+  room.experimental_hooks.on("message.dispatch", async ({ experimental_submission: submission, thread }) => {
+    const pick =
+      submission?.pluginId === room.pluginId ? pendingPinSchema.safeParse(submission.data).data : undefined;
+    if (
+      pick &&
+      thread.providerId === pick.provider &&
+      thread.executionTarget !== "cloud" &&
+      usable(pick.provider, pick.id) &&
+      pins.thread[thread.id]?.[pick.provider] !== pick.id
+    )
+      await pin({ threadId: thread.id, projectId: thread.projectId }, pick.provider, "thread", pick.id);
+    return { action: "proceed" };
+  });
+
   room.providers.experimental_contributeEnv(
     "claude-code",
-    async (context: { threadId?: string; hostId?: string }) => {
+    async (context: {
+      threadId?: string;
+      hostId?: string;
+      projectId?: string;
+      requestId?: string;
+      runningTurnRequestId?: string;
+    }) => {
       // Another machine runs on its own login unless it gets an account's one-year token below (#531).
-      const [remote, threadId] = await Promise.all([
-        onAnotherMachine(context.hostId),
-        newTurn(context.threadId),
-      ]);
-      noteOwnLogin(threadId, remote);
+      const remote = await onAnotherMachine(context.hostId);
       await refreshMac();
-      const id = current("claude-code");
-      noteThreadAccount(threadId, id);
+      const id = accountFor("claude-code", context.threadId, context.projectId);
+      // Without an account's credentials, another machine runs on its own login and this one on an unknown one.
+      const launched = (account?: string) =>
+        noteRequest(context, {
+          provider: "claude-code",
+          own: account === undefined && remote,
+          ...(account === undefined ? {} : { account }),
+        });
       const account = accounts.find((entry) => entry.id === id);
-      if (!account) return [];
+      if (!account) {
+        // This Mac's own login, while it has one.
+        await launched(id === LOCAL && !remote && mac !== null ? LOCAL : undefined);
+        return [];
+      }
       const reason = `Cloudroom account ${account.email ?? account.id}`;
       if (account.profile) {
         // The account's folder exists only on this computer.
-        if (remote) return [];
+        if (remote) {
+          await launched(undefined);
+          return [];
+        }
+        await launched(id);
         const profile = profilePath(account.profile);
         await prepareProfile(profile).catch((error: unknown) =>
           room.log.warn(
@@ -1201,8 +1411,12 @@ export default async function plugin(room: BbPluginApi) {
         ];
       }
       const secret = await readSecret(account.id).catch(() => null);
-      if (!secret) return [];
-      noteOwnLogin(threadId, false);
+      // No token: the CLI falls back to whatever login its machine has.
+      if (!secret) {
+        await launched(undefined);
+        return [];
+      }
+      await launched(id);
       return [
         { name: "CLAUDE_CODE_OAUTH_TOKEN", value: secret.accessToken, reason },
         { name: "ANTHROPIC_API_KEY", value: "", reason },
@@ -1212,11 +1426,24 @@ export default async function plugin(room: BbPluginApi) {
 
   room.providers.experimental_contributeEnv(
     "acp-cursor",
-    async (context: { threadId?: string }) => {
-      const id = current("acp-cursor");
-      noteThreadAccount(context.threadId, id);
+    async (context: {
+      threadId?: string;
+      hostId?: string;
+      projectId?: string;
+      requestId?: string;
+      runningTurnRequestId?: string;
+    }) => {
+      const id = accountFor("acp-cursor", context.threadId, context.projectId);
       const account = accounts.find((entry) => entry.id === id);
       const key = account ? await readCursorKey(account).catch(() => null) : null;
+      // An account's key runs anywhere. Without one the CLI runs on its machine's own Cursor login: this Mac's only
+      // when no account was meant, and another machine's own otherwise.
+      const remote = !key && (await onAnotherMachine(context.hostId));
+      await noteRequest(context, {
+        provider: "acp-cursor",
+        own: remote,
+        ...(key ? { account: id } : id === LOCAL && !remote ? { account: LOCAL } : {}),
+      });
       if (!account || !key) return [];
       const reason = `Cloudroom account ${account.email ?? account.id}`;
       return Object.entries(cursorEnv(key)).map(([name, value]) => ({
@@ -1229,25 +1456,34 @@ export default async function plugin(room: BbPluginApi) {
 
   room.events.on("turn.failed", async (event) => {
     if (event.errorInfo?.category !== "rate-limit") return;
+    // Read before any wait: what the failed request ran on, whatever the thread has become since (Teleport, another
+    // agent, another pin or default). Only a failure core says ran Local is one of this computer's launches: a Cloud
+    // turn after Teleport can name the last Local request, since the handoff appends none. A request this plugin never
+    // saw ran on what the thread was last handed (lastLaunch).
+    const local = event.experimental_executionTarget === "local";
+    const exact = local ? launches.get(launchKey(event.threadId, event.requestId)) : undefined;
+    const latest = local ? lastLaunch.get(event.threadId) : undefined;
     const thread = await room.sdk.threads
       .get({ threadId: event.threadId })
       .catch(() => null);
-    const provider = providerSchema.safeParse(thread?.providerId);
+    // The thread's latest launch stands in only while the thread is still on that agent: a turn of an agent this plugin
+    // hands no env to (any other harness) notes nothing, so an older launch would put its limit on the wrong account.
+    const launch = exact ?? (latest?.provider === thread?.providerId ? latest : undefined);
+    const provider = providerSchema.safeParse(launch?.provider ?? thread?.providerId);
     if (!provider.success) return;
     // The machine's own login hit its limit: no account here is limited, and no switch here moves the thread.
-    if (onOwnLogin(thread)) return;
-    // Cloud threads use the selected account, so they have no entry here. A Local thread without one started its turn
-    // before this plugin did (a restart): the account it ran on is unknown, so no account is marked limited.
-    const ran = threadAccount.get(event.threadId);
-    const used = ran ?? current(provider.data);
+    if (launch?.own) return;
+    // A Cloud turn ran on the one login Cloud keeps for its agent. A Local one names an account only when this plugin
+    // handed it out; a turn from before a restart ran on one it cannot prove, so no account is marked limited.
+    const used =
+      event.experimental_executionTarget === "cloud"
+        ? inCloudFor(provider.data)
+        : launch?.account;
     const several =
       provider.data === "codex"
         ? codexAccounts > 0
         : ids(provider.data).length > 1;
-    if (
-      (ran !== undefined || thread?.executionTarget === "cloud") &&
-      (used !== LOCAL || several)
-    ) {
+    if (used !== undefined && (used !== LOCAL || several)) {
       limits[`${provider.data}:${used}`] =
         blockedUntil(event.rateLimits) ?? Date.now() + DEFAULT_REST_MS;
       limitedAt.set(`${provider.data}:${used}`, Date.now());
@@ -1261,19 +1497,22 @@ export default async function plugin(room: BbPluginApi) {
           ),
         );
     }
-    // Core continues Cloud threads on a new login (ADR 0117).
-    if (thread?.executionTarget === "cloud") return;
-    // Noted even with one account: adding and picking a second one continues it too.
-    await limited.record(
-      event.threadId,
-      provider.data,
-      used,
-      event.requestId,
-    );
-    const now = current(provider.data);
-    // It ran on an account the user already switched away from: it continues on the new one at once.
-    if (used !== now && limitedUntil(provider.data, now) === null)
-      await limited.resume(event.threadId, now);
+    // Core continues Cloud threads on a new login (ADR 0117), even one back on this computer since; a thread now in
+    // Cloud or on another agent is not this failure's to continue. A failure of unknown origin still waits for a pick.
+    if (
+      event.experimental_executionTarget === "cloud" ||
+      !thread ||
+      (await waitingHere(provider.data, thread.id, thread)) === null
+    )
+      return;
+    // Noted even with one account, or pinned: adding and picking a second one, or a new pin, continues it too. A new
+    // default never moves a pinned thread (noteInUse). An unknown account still waits for the user's next pick.
+    const now = accountFor(provider.data, thread.id, thread.projectId);
+    const ranOn = used ?? now;
+    await limited.record(thread.id, provider.data, ranOn, event.requestId);
+    // It ran on an account the user already switched or pinned away from: it continues on the new one at once.
+    if (ranOn !== now && limitedUntil(provider.data, now) === null)
+      await limited.resume(thread.id, now);
   });
 
   // A thread that runs again, or is gone, no longer waits for a switch.
@@ -1283,23 +1522,38 @@ export default async function plugin(room: BbPluginApi) {
     "thread.deleted",
   ] as const)
     room.events.on(name, ({ thread }) => limited.forget(thread.id));
+  room.events.on("thread.deleted", async ({ thread }) => {
+    lastLaunch.delete(thread.id);
+    if (!(thread.id in pins.thread)) return;
+    delete pins.thread[thread.id];
+    await savePins();
+  });
+  // Plugins hear of no project deletion: a pin to a project that is gone is dropped at start.
+  background(
+    (async () => {
+      let dropped = false;
+      for (const projectId of Object.keys(pins.project)) {
+        const status = await room.sdk.projects
+          .get({ projectId })
+          .then(() => 200, (error: unknown) => Reflect.get(Object(error), "status"));
+        if (status !== 404) continue;
+        delete pins.project[projectId];
+        dropped = true;
+      }
+      if (dropped) await savePins();
+    })(),
+  );
 
-  // A turn that began after the limit and ended fine: the account works again, as after a limit reset from Claude.
-  // A turn already running when the limit hit proves nothing, so it never clears it.
-  room.events.on("thread.active", ({ thread }) => {
-    turnBegan.set(thread.id, Date.now());
-  });
-  room.events.on("thread.failed", ({ thread }) => {
-    turnBegan.delete(thread.id);
-  });
-  room.events.on("thread.idle", async ({ thread }) => {
-    const began = turnBegan.get(thread.id);
-    turnBegan.delete(thread.id);
-    const provider = providerSchema.safeParse(thread.providerId);
-    if (began === undefined || !provider.success || onOwnLogin(thread)) return;
-    const used = threadAccount.get(thread.id) ?? current(provider.data);
-    const key = `${provider.data}:${used}`;
-    if (!(key in limits) || began <= (limitedAt.get(key) ?? 0)) return;
+  // A turn that began after the limit and ended fine: the account it ran on works again, as after a limit reset from
+  // Claude. A turn already running when the limit hit proves nothing, so it never clears it. Only a Local turn this
+  // plugin launched, named by the request it ended on, clears one: a Cloud turn may name the last Local request.
+  room.events.on("thread.idle", async ({ thread, experimental_requestId: requestId }) => {
+    if (requestId === undefined || thread.executionTarget === "cloud") return;
+    const launch = launches.get(launchKey(thread.id, requestId));
+    const used = launch?.account;
+    if (!launch || launch.own || used === undefined) return;
+    const key = `${launch.provider}:${used}`;
+    if (!(key in limits) || launch.at <= (limitedAt.get(key) ?? 0)) return;
     delete limits[key];
     limitedAt.delete(key);
     await kv.set("limits:v1", limits);
@@ -1314,12 +1568,20 @@ export default async function plugin(room: BbPluginApi) {
       );
   });
 
-  // Codex signs in from the app (codex-accounts.ts); this only notes which account each thread starts on.
+  // Codex signs in from the app (codex-accounts.ts), which never hands its tokens here: a pinned thread only names
+  // its account, and the app swaps that name for the account's sign-in.
   room.providers.experimental_contributeEnv(
     "codex",
-    async (context: { threadId?: string }) => {
-      noteThreadAccount(context.threadId, codexInUse);
-      return [];
+    async (context: { threadId?: string; projectId?: string; requestId?: string; runningTurnRequestId?: string }) => {
+      const pin = pinned("codex", context.threadId, context.projectId);
+      // The app picks the sign-in: the pin while the account still exists, else its selected account (none, the Mac's
+      // own login, when signed out). This plugin's copy of both is from the last list, which is as close as it gets.
+      const runs =
+        pin === undefined || (pin !== LOCAL && codexKnown !== undefined && !codexKnown.has(pin)) ? codexInUse : pin;
+      await noteRequest(context, { provider: "codex", own: false, account: runs });
+      return pin === undefined
+        ? []
+        : [{ name: CODEX_ACCOUNT_ENV, value: pin, reason: "Cloudroom Codex account pinned to this thread" }];
     },
   );
 }

@@ -92,20 +92,31 @@ export async function limitedThreads(
       account: string,
       requestId?: string,
     ) {
+      // Noted again without a turn (picked from the thread): it still continues the turn that failed.
+      const failed = requestId ?? stopped[threadId]?.requestId;
       stopped[threadId] = {
         provider,
         account,
-        ...(requestId ? { requestId } : {}),
+        ...(failed ? { requestId: failed } : {}),
       };
       await save();
     },
     account: (threadId: string) => stopped[threadId]?.account,
-    /** `to` is now the account in use: every thread another account's limit stopped continues on it. */
-    async switched(provider: Provider, to: string) {
+    /** Every thread this agent's limit stopped continues on the account `target` names for it; none leaves it
+     *  waiting. One already on that account keeps waiting too. */
+    async resumeEach(
+      provider: Provider,
+      target: (threadId: string) => Promise<string | undefined>,
+    ) {
       const waiting = Object.keys(stopped).filter(
         (threadId) => stopped[threadId]?.provider === provider,
       );
-      await Promise.allSettled(waiting.map((threadId) => resume(threadId, to)));
+      await Promise.allSettled(
+        waiting.map(async (threadId) => {
+          const to = await target(threadId);
+          if (to !== undefined) await resume(threadId, to);
+        }),
+      );
     },
   };
 }

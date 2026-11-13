@@ -12,16 +12,23 @@ import {
   experimental_ProviderIcon as ProviderIcon,
   experimental_useProviders as useProviders,
   useBbNavigate,
+  useComposer,
   useRealtime,
   useRpc,
+  useSdk,
 } from "@get-bb/plugin-sdk/app";
 import { Button } from "@cloudroom/shared-ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@cloudroom/shared-ui/dropdown-menu";
+import { useIsCompactViewport } from "@cloudroom/shared-ui/hooks/use-compact-viewport";
 import { Icon } from "@cloudroom/shared-ui/icon";
 import { hideEmail, usePrivacyMode } from "@cloudroom/shared-ui/lib/privacy-mode";
 import { cn } from "@cloudroom/shared-ui/lib/utils";
@@ -32,6 +39,7 @@ import {
   MAX_ACCOUNTS,
   type AccountView,
   type Provider,
+  type ThreadAccounts,
   type accountsRpcContract,
 } from "./src/contract.js";
 
@@ -799,6 +807,166 @@ function AccountsPage() {
   );
 }
 
+// The composer's account picker, by the agent and model pickers: pins this Local thread, or every Local thread in its
+// project, to one account of its agent. Unpinned threads follow the default, the account in use in Settings → Agents →
+// Accounts. In a new thread's composer, "This thread" is held until the first message, which carries it.
+const DEFAULT = "default";
+// Thread changes that never move it to another project, agent, or machine, so they leave the picker as it is.
+const QUIET_CHANGES: ReadonlySet<string> = new Set([
+  "events-appended",
+  "status-changed",
+  "read-state-changed",
+  "queue-changed",
+  "interactions-changed",
+  "title-changed",
+  "order-changed",
+  "tabs-changed",
+  "terminals-changed",
+]);
+function ComposerAccountButton() {
+  const { scope } = useComposer();
+  if (scope.kind === "thread") return <ThreadAccountButton threadId={scope.threadId} />;
+  if (scope.kind !== "new-thread" || scope.experimental_executionTarget !== "local") return null;
+  const provider = AGENTS.find((agent) => agent.provider === scope.experimental_providerId)?.provider;
+  return scope.projectId && provider ? (
+    <NewThreadAccountButton key={`${scope.projectId}/${provider}`} projectId={scope.projectId} provider={provider} />
+  ) : null;
+}
+
+// Reads the picker's accounts again on every accounts change; only the latest read lands.
+function useThreadAccounts(threadId: string | null, projectId = "", provider: Provider = "claude-code") {
+  const rpc = useRpc<typeof accountsRpcContract>();
+  const [view, setView] = useState<ThreadAccounts | null>(null);
+  const latest = useRef(0);
+  const load = useCallback(() => {
+    const request = ++latest.current;
+    const land = (next: ThreadAccounts | null) => {
+      if (request === latest.current) setView(next);
+    };
+    void rpc
+      .call("accounts.thread", threadId === null ? { projectId, provider } : { threadId })
+      .then(land, () => land(null));
+  }, [rpc, threadId, projectId, provider]);
+  useEffect(() => load(), [load]);
+  useRealtime(ACCOUNTS_CHANGED, load);
+  return { view, load, rpc };
+}
+
+function ThreadAccountButton({ threadId }: { threadId: string }) {
+  const sdk = useSdk();
+  const { view, load, rpc } = useThreadAccounts(threadId);
+  const [problem, setProblem] = useState<string | null>(null);
+  // A switch of agent, project, or to Cloud keeps the thread id: the picker reads the thread again.
+  useEffect(
+    () =>
+      sdk.subscribe({
+        event: "thread:changed",
+        threadId,
+        callback: (event) => {
+          if (event.changes.some((change) => !QUIET_CHANGES.has(change))) load();
+        },
+      }),
+    [sdk, threadId, load],
+  );
+  if (!view || view.cloud) return null;
+  const pin = (scope: "thread" | "project", value: string) => {
+    setProblem(null);
+    void rpc
+      .call("accounts.pin", { threadId, scope, id: value === DEFAULT ? null : value })
+      .then(load, (error: unknown) => setProblem(errorText(error)));
+  };
+  return (
+    <AccountMenu view={view} thread={view.thread} pin={pin} note={problem ?? "Applies from the next turn."} />
+  );
+}
+
+function NewThreadAccountButton({ projectId, provider }: { projectId: string; provider: Provider }) {
+  const composer = useComposer();
+  const { view, load, rpc } = useThreadAccounts(null, projectId, provider);
+  const [problem, setProblem] = useState<string | null>(null);
+  // "This thread" for the thread not created yet: its first message carries the pick (pendingPinSchema).
+  const [pick, setPick] = useState<string | null>(null);
+  const { experimental_setSubmissionData: hold } = composer;
+  useEffect(() => {
+    hold(pick === null ? null : { provider, id: pick });
+    return () => hold(null);
+  }, [hold, pick, provider]);
+  if (!view) return null;
+  const pin = (scope: "thread" | "project", value: string) => {
+    setProblem(null);
+    if (scope === "thread") return setPick(value === DEFAULT ? null : value);
+    void rpc
+      .call("accounts.pin", { projectId, provider, scope, id: value === DEFAULT ? null : value })
+      .then(load, (error: unknown) => setProblem(errorText(error)));
+  };
+  return (
+    <AccountMenu view={view} thread={pick} pin={pin} note={problem ?? "This thread's pick applies from its first turn."} />
+  );
+}
+
+function AccountMenu({
+  view,
+  thread,
+  pin,
+  note,
+}: {
+  view: ThreadAccounts;
+  // This thread's own pick (a new thread's is held until it is sent).
+  thread: string | null;
+  pin: (scope: "thread" | "project", value: string) => void;
+  note: string;
+}) {
+  const [privacy] = usePrivacyMode();
+  const isCompactViewport = useIsCompactViewport();
+  // One account leaves nothing to pick.
+  if (view.accounts.length < 2 && !thread && !view.project) return null;
+  const name = (id: string) =>
+    hideEmail(view.accounts.find((account) => account.id === id)?.label ?? "Account", privacy);
+  const using = thread ?? view.project ?? view.default;
+  const options = (fallback: string) => (
+    <>
+      <DropdownMenuRadioItem value={DEFAULT}>{fallback}</DropdownMenuRadioItem>
+      {view.accounts.map((account) => (
+        <DropdownMenuRadioItem key={account.id} value={account.id}>
+          {hideEmail(account.label, privacy)}
+        </DropdownMenuRadioItem>
+      ))}
+    </>
+  );
+  const title = `Account: ${name(using)}${thread ? " (this thread)" : view.project ? " (this project)" : " (default)"}`;
+  return (
+    <DropdownMenu modal={false}>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-label={title}
+          className={cn(
+            "h-7 max-w-48 gap-1.5 px-2 text-xs text-muted-foreground",
+            (thread || view.project) && "text-foreground",
+          )}
+        >
+          <Icon name="UserRound" className="size-3.5" />
+          {isCompactViewport ? null : <span className="truncate">{name(using)}</span>}
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="w-64">
+        <DropdownMenuLabel>This thread</DropdownMenuLabel>
+        <DropdownMenuRadioGroup value={thread ?? DEFAULT} onValueChange={(value) => pin("thread", value)}>
+          {options(view.project ? `Project's (${name(view.project)})` : `Default (${name(view.default)})`)}
+        </DropdownMenuRadioGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>All Local threads in this project</DropdownMenuLabel>
+        <DropdownMenuRadioGroup value={view.project ?? DEFAULT} onValueChange={(value) => pin("project", value)}>
+          {options(`Default (${name(view.default)})`)}
+        </DropdownMenuRadioGroup>
+        <DropdownMenuSeparator />
+        <p className="px-2 py-1.5 text-xs text-muted-foreground">{note} Cloud threads use the default account.</p>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 export default definePluginApp((app) => {
   // Settings → Agents → Accounts, the one place for every agent's accounts.
   app.slots.settingsSection({
@@ -807,5 +975,10 @@ export default definePluginApp((app) => {
     title: "Agent accounts",
     description: "Add and switch Claude Code, Codex, and Cursor subscriptions.",
     component: AccountsPage,
+  });
+  app.composer.customize({
+    id: "thread-account",
+    scopes: ["thread", "new-thread"],
+    actions: [{ id: "account", component: ComposerAccountButton }],
   });
 });

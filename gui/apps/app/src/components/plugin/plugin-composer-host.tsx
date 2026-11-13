@@ -30,6 +30,8 @@ export interface PluginComposerHost {
     options: ExperimentalComposerSubmitOptions,
     pluginSubmission: { pluginId: string; data: JsonValue } | undefined,
   ): Promise<void>;
+  /** New-thread composers: data a plugin attaches to ordinary sends. */
+  setSubmissionData?(pluginId: string, data: JsonValue | null): void;
 }
 
 export function composerScopeIdentity(scope: PluginComposerScope): string {

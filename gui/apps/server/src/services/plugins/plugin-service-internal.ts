@@ -16,6 +16,7 @@ import type {
   PluginRuntimeStatus,
 } from "@cloudroom/server-contract";
 import type { ServerLogger } from "../../types.js";
+import type { TurnFailedOrigin } from "../threads/turn-failed.js";
 import type { TelemetryService } from "../system/telemetry.js";
 import type { NotificationHub } from "../../ws/hub.js";
 import type { BundledPluginRegistration } from "./builtin-registry.js";
@@ -232,9 +233,10 @@ export interface PluginThreadEventEmitter {
   /**
    * A turn on this thread failed and the thread has already landed in `error`.
    * Takes the id alone: the payload is read from the failed turn's own records,
-   * and only when a plugin is listening.
+   * and only when a plugin is listening. So is `origin`, which reads what was
+   * true when the failure was applied: unlike the payload, it runs at once.
    */
-  emitTurnFailed(threadId: string): void;
+  emitTurnFailed(threadId: string, origin?: () => TurnFailedOrigin): void;
 }
 
 export type PluginWireLookup<T> =

@@ -267,6 +267,13 @@ export interface PluginTurnFailedEvent {
    * it on its own, since the turn may be what took the machine down.
    */
   turnStartedBeforeBoot: boolean;
+  /**
+   * Where the failed request ran, read when core applied the failure: not the
+   * thread's target now, which Teleport may have changed since. Absent when
+   * core does not know, so treat absent as unknown. A failure a newer request
+   * overtook before this event was built is not announced.
+   */
+  experimental_executionTarget?: "local" | "cloud";
 }
 
 /**
@@ -313,8 +320,16 @@ export interface PluginThreadEventPayloads {
   "thread.active": { thread: ThreadResponse };
   /** Fired when a thread transitions into `idle`. `lastAssistantText` is
    * assembled the same way GET /threads/:id/output is. `notify: false`: another
-   * computer sent this Cloud turn and notifies for it. */
-  "thread.idle": { thread: ThreadResponse; lastAssistantText: string | null; notify?: false };
+   * computer sent this Cloud turn and notifies for it.
+   * `experimental_requestId`: the thread's last client request when it went
+   * idle, the turn that just ended for a Local thread. A Cloud handoff appends
+   * no request, so on a Cloud thread it can name an earlier Local one. */
+  "thread.idle": {
+    thread: ThreadResponse;
+    lastAssistantText: string | null;
+    notify?: false;
+    experimental_requestId?: string;
+  };
   /** Fired when a thread transitions into `error`. `error` is the failed
    * turn's provider error, else the latest system/error message. `errorInfo`
    * classifies it the same way `turn.failed` does (a rate limit, an auth
@@ -1788,6 +1803,23 @@ export interface ExperimentalPluginProviderEnvContext {
   threadId?: string;
   projectId?: string;
   hostId: string;
+  /**
+   * The `client/turn/requested` id the command carries, the same id a later
+   * `turn.failed` names, when the server has it before the command is built.
+   * Absent for a helper call, a command that sends no request (resume, Goal
+   * changes, Teleport's snapshot), requests whose id is made later (retries),
+   * and "auto" requests that name no running turn, which may start a turn or
+   * join one.
+   */
+  requestId?: string;
+  /**
+   * With `requestId`, for a steer or an "auto" request (a child's report, say)
+   * aimed at a running turn: a request that provider turn already accepted.
+   * That turn's process keeps the environment it started with, so this
+   * resolution's entries do not reach it. If the turn ended before the command
+   * landed, a new turn starts on this resolution's entries instead.
+   */
+  runningTurnRequestId?: string;
 }
 
 export interface ExperimentalPluginProviderEnvEntry {

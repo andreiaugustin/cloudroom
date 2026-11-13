@@ -27,6 +27,21 @@ const accountsSchema = z.array(
   }),
 );
 type AccountView = z.infer<typeof accountsSchema>[number];
+// The accounts plugin's `accounts.thread`: the thread's own pin, its project's, and the default.
+const threadAccountsSchema = z
+  .object({
+    default: z.string(),
+    thread: z.string().nullable(),
+    project: z.string().nullable(),
+  })
+  .nullable();
+
+/** The account a Local thread runs on: its pin, else its project's, else the default. */
+export function threadAccountId(
+  pins: z.infer<typeof threadAccountsSchema> | undefined,
+): string | null {
+  return pins ? (pins.thread ?? pins.project ?? pins.default) : null;
+}
 
 export interface PlanLimitAccount {
   id: string;
@@ -68,8 +83,15 @@ export function nextAccount(
   );
 }
 
-/** The thread agent's accounts (ADR 0194). Every other signed-in account is offered, even at its limit. */
-export function usePlanLimitAccounts(providerId: string) {
+/**
+ * The thread agent's accounts (ADR 0194): the one the thread runs on, and every other signed-in account, offered even at
+ * its limit. A Local thread runs on its pin when it has one; a Cloud thread on the default, the one Cloud keeps.
+ */
+export function usePlanLimitAccounts(
+  providerId: string,
+  threadId: string,
+  isCloud: boolean,
+) {
   const enabled = PROVIDERS.has(providerId);
   const queryClient = useQueryClient();
   useEffect(() => {
@@ -92,6 +114,18 @@ export function usePlanLimitAccounts(providerId: string) {
     staleTime: 60_000,
     refetchOnWindowFocus: false,
   });
+  const { data: pins } = useQuery({
+    queryKey: [QUERY_KEY, providerId, threadId],
+    queryFn: async () =>
+      threadAccountsSchema.parse(
+        await callPluginRpc(fetch, PLUGIN, "accounts.thread", { threadId }),
+      ),
+    enabled: enabled && !isCloud && threadId !== "",
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
+  });
+  // Until the pins load, the default stands in.
+  const runsOn = isCloud ? null : threadAccountId(pins);
   const accounts = (data ?? [])
     // "This Mac" without an email has no login on this computer.
     .filter(
@@ -102,7 +136,7 @@ export function usePlanLimitAccounts(providerId: string) {
     .map((account) => ({
       id: account.id,
       label: account.name ?? account.email ?? `This ${COMPUTER_TITLE}`,
-      inUse: account.inUse,
+      inUse: runsOn === null ? account.inUse : account.id === runsOn,
       limitedUntil: account.limitedUntil ?? null,
       windows: account.windows,
     }));
@@ -113,8 +147,9 @@ export function usePlanLimitAccounts(providerId: string) {
 }
 
 /**
- * Picks the account every thread uses (ADR 0197). The plugin then continues every Local thread the old account's limit
- * stopped, this one included (ADR 20261107-082836); Core does the same for Cloud threads after the new login (ADR 0117).
+ * Picks the account every thread uses (ADR 0197), or for a pinned Local thread the one it is pinned to. The plugin then
+ * continues every Local thread the old account's limit stopped, this one included (ADR 20261107-082836); Core does the
+ * same for Cloud threads after the new login (ADR 0117).
  */
 export async function switchAccount(args: {
   providerId: string;

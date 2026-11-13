@@ -73,6 +73,8 @@ export interface TurnRequestRetryMarker {
 }
 
 interface ClientTurnRequestedEventArgs {
+  /** Made by the caller when the command it builds must carry it; otherwise made here. */
+  requestId?: ClientTurnRequestId;
   /**
    * Set only when a `turn.failed` retry row is dispatching, marking this turn
    * as attempt N of an earlier request rather than something the user just
@@ -294,7 +296,7 @@ function appendBuiltClientTurnEvent(
     case "client/turn/requested": {
       return appendBuiltClientTurnRequestedEvent(append, {
         ...args,
-        requestId: createClientTurnRequestId(),
+        requestId: args.requestId ?? createClientTurnRequestId(),
       });
     }
   }
@@ -839,6 +841,20 @@ export function appendThreadOwnershipChangeEventInTransaction(
   const sequence = appendThreadEventInTransaction(deps.db, eventArgs);
   deps.hub.notifyThread(args.threadId, ["events-appended"]);
   return sequence;
+}
+
+/** The client request a provider turn accepted last, or null when it accepted none this server recorded. */
+export function getTurnRequestIdForTurn(
+  deps: ThreadEventReadDeps,
+  args: { threadId: string; turnId: string },
+): string | null {
+  const row = getStoredTurnRequestEventForTurn(deps.db, args);
+  if (!row) return null;
+  try {
+    return parseStoredTurnRequestEvent(row).requestId;
+  } catch {
+    return null;
+  }
 }
 
 export function getActiveTurnId(

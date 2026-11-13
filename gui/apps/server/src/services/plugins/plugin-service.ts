@@ -101,6 +101,7 @@ import {
 import {
   buildTurnFailedEvent,
   describeFailedTurn,
+  loadFailedTurn,
 } from "../threads/turn-failed.js";
 import type {
   PluginBrandingAssetSet,
@@ -1257,11 +1258,17 @@ export function createPluginService(deps: PluginServiceDeps): PluginService {
         }));
       },
       emitThreadIdle(thread) {
-        emitThreadEvent("thread.idle", () => ({
-          thread: buildThreadDto(thread),
-          lastAssistantText: getLastThreadOutput(deps.db, thread.id),
-          ...(cloudTurnsElsewhere.has(thread.id) ? { notify: false as const } : {}),
-        }));
+        emitThreadEvent(
+          "thread.idle",
+          (requestId) => ({
+            thread: buildThreadDto(thread),
+            lastAssistantText: getLastThreadOutput(deps.db, thread.id),
+            ...(cloudTurnsElsewhere.has(thread.id) ? { notify: false as const } : {}),
+            ...(requestId ? { experimental_requestId: requestId } : {}),
+          }),
+          // The last request, read now: by the time the payload is built, the next turn's request may have landed.
+          () => loadFailedTurn(deps.db, thread.id)?.request.requestId,
+        );
       },
       emitThreadFailed(thread) {
         emitThreadEvent("thread.failed", () => {
@@ -1301,11 +1308,13 @@ export function createPluginService(deps: PluginServiceDeps): PluginService {
       emitMessageDispatched:
         buildQueuedMessageEventEmitter("message.dispatched"),
       emitMessageCancelled: buildQueuedMessageEventEmitter("message.cancelled"),
-      emitTurnFailed(threadId) {
+      emitTurnFailed(threadId, origin) {
         // Built lazily inside the emitter: with no listener the failure path
         // pays one map lookup and never touches the database.
-        emitThreadEvent("turn.failed", () =>
-          buildTurnFailedEvent(deps.db, threadId),
+        emitThreadEvent(
+          "turn.failed",
+          (captured) => buildTurnFailedEvent(deps.db, threadId, captured),
+          origin,
         );
       },
     },

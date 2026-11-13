@@ -542,7 +542,7 @@ function PromptSubmitButton({
   );
 }
 
-/** The bottom row: plus menu and footer on the left, mic and send on the right, voice bar on top. */
+/** The bottom row: plus menu, footer and plugin actions on the left, mic and send on the right, voice bar on top. */
 export function PromptActionRow({
   isCompact,
   isPointerCoarse,
@@ -638,6 +638,8 @@ export function PromptActionRow({
           aria-live="polite"
         >
           {start}
+          {/* Plugin controls sit with the agent and model pickers. */}
+          <ComposerActionsSlot includePluginContributions={includePluginActions} />
         </div>
       )}
       <div
@@ -648,7 +650,7 @@ export function PromptActionRow({
         )}
         inert={covered}
       >
-        <ComposerActionsSlot includePluginContributions={includePluginActions}>
+        <>
           {voice && showMic ? (
             <Button
               data-promptbox-expanded-only={isCompact ? undefined : ""}
@@ -709,7 +711,7 @@ export function PromptActionRow({
               />
             )}
           </div>
-        </ComposerActionsSlot>
+        </>
       </div>
     </div>
   );

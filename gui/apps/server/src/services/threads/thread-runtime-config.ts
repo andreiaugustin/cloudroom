@@ -44,6 +44,9 @@ import {
   pluginInstructionMaxChars,
 } from "./custom-instructions.js";
 
+const CODEX_ACCOUNT_ENV = "CLOUDROOM_CODEX_ACCOUNT";
+const ACCOUNTS_PLUGIN_ID = "accounts";
+
 // Claude Code's native question tool and the ask-user-question plugin tool
 // share this name, so one setting hides question cards for every provider.
 const ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion";
@@ -62,6 +65,9 @@ interface ResolveThreadRuntimeCommandConfigArgs {
   environment: ThreadRuntimeCommandEnvironment;
   model: string;
   thread: Thread;
+  /** The client turn request this command carries, when it is known before the command is built. Provider env
+   *  resolvers get it so they can tie the login they hand out to that request (ExperimentalPluginProviderEnvContext). */
+  turnRequest?: { requestId: string; runningTurnRequestId?: string };
 }
 
 export interface ResolvedThreadRuntimeCommandConfig {
@@ -188,6 +194,22 @@ export async function resolveThreadRuntimeCommandConfig(
     },
     skillIdsByPlugin,
   });
+  const loginEnv = await providerLoginEnvironment(deps, {
+    hostId: host.id,
+    providerId: args.thread.providerId,
+    threadId: args.thread.id,
+    projectId: project.id,
+    ...(args.turnRequest ?? {}),
+  });
+  // The accounts plugin names a pinned Codex account; only this app holds its sign-in (plugins/accounts). Another
+  // plugin's entry by that name is dropped, never used.
+  const codexPin = loginEnv.find(
+    (entry) =>
+      entry.name === CODEX_ACCOUNT_ENV &&
+      "plugin" in entry.source &&
+      entry.source.plugin === ACCOUNTS_PLUGIN_ID,
+  )?.value;
+  const pinnedCodex = typeof codexPin === "string" ? codexPin : undefined;
   const contributedEnv = mergeHostAndProviderEnvironment(
     [
       ...(await resolveHostEnvironment(deps, {
@@ -195,15 +217,10 @@ export async function resolveThreadRuntimeCommandConfig(
         projectId: project.id,
       })),
       ...(args.thread.providerId === "codex"
-        ? await cloudroom(deps).codexAccounts.environment()
+        ? await cloudroom(deps).codexAccounts.environment(pinnedCodex)
         : []),
     ],
-    await providerLoginEnvironment(deps, {
-      hostId: host.id,
-      providerId: args.thread.providerId,
-      threadId: args.thread.id,
-      projectId: project.id,
-    }),
+    loginEnv.filter((entry) => entry.name !== CODEX_ACCOUNT_ENV),
   );
   const injectedSkillSources = resolveSkillCatalog(deps, {
     projectSkillSources,

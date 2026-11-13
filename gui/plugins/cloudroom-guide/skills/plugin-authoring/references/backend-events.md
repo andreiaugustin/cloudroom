@@ -7,7 +7,7 @@ bb.events.on("experimental_thread.events", ({ thread, sequence }) => { ... });
 bb.events.on("experimental_terminal.input", ({ terminal }) => { ... });
 bb.events.on("thread.created", ({ thread }) => { ... });
 bb.events.on("thread.active", ({ thread }) => { ... });
-bb.events.on("thread.idle", ({ thread, lastAssistantText }) => { ... });   // lastAssistantText: string | null
+bb.events.on("thread.idle", ({ thread, lastAssistantText, experimental_requestId }) => { ... });   // lastAssistantText: string | null
 bb.events.on("thread.failed", ({ thread, error, errorInfo }) => { ... });  // error: string | null; errorInfo: { category } | null
 bb.events.on("thread.archived", ({ thread }) => { ... });
 bb.events.on("thread.unarchived", ({ thread }) => { ... });
@@ -49,7 +49,13 @@ provider took the input into its conversation before failing), `rateLimits`
 (the latest `ProviderRateLimitState`, null when the provider reports no
 windows), `attemptNumber` (1 on a first failure, 2 on the first retry's) and
 `interruptionReason` (`host-daemon-restarted` when the app or its daemon
-restarted mid-turn; null for provider failures).
+restarted mid-turn; null for provider failures). `experimental_executionTarget`
+(`local` or `cloud`) is where the failed request ran, read when core applied the
+failure rather than the thread's target now; absent means unknown. A failure a
+newer request overtook before the event was built is not announced.
+`thread.idle`'s `experimental_requestId` is the thread's last request when it
+went idle. A Cloud handoff appends no request, so on a Cloud thread it can name
+an earlier Local one: check `thread.executionTarget` before tying it to a turn.
 There is no thread DTO and no copy of the message, because a retry is asked for
 BY REFERENCE:
 
@@ -149,7 +155,10 @@ is `PluginDispatchExecutionSources`); the return value is
 The hook pass runs before scheduling, thread, workspace, host, and interaction
 waits. Plugin policy therefore sees each submission before operational state
 can defer it. `experimental_submission` is present only on the initial
-composer submission; a plugin that waits can recognize later attempts through
+composer submission (a plugin's `submit({ experimental_data })`, or data it
+holds with `useComposer().experimental_setSubmissionData` on a new thread's
+first send; the pass completes before that thread's first turn starts, so a
+handler can persist per-thread state the turn's provider env reads); a plugin that waits can recognize later attempts through
 `ctx.queuedMessage.waitingOn.pluginId`.
 
 Decisions are `proceed`, `wait` (`reason`, optional `sendAt` epoch ms, which

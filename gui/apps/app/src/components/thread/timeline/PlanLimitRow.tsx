@@ -61,7 +61,11 @@ export function PlanLimitRow({
 }) {
   const { thread, model, self, selfResetsAt, agents, primary } =
     usePlanLimitAgents(threadId);
-  const accounts = usePlanLimitAccounts(thread?.providerId ?? "");
+  const accounts = usePlanLimitAccounts(
+    thread?.providerId ?? "",
+    threadId,
+    thread?.executionTarget === "cloud",
+  );
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState<string | null>(null);
   // Kept from the click: the thread moves to `to` midway, and `from` is the agent that hit the limit.

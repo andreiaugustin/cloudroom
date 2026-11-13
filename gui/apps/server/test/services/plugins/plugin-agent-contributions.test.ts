@@ -1,10 +1,12 @@
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createConnection,
   getAppSettings,
+  threads,
   migrate,
   setAppSettings,
   type DbConnection,
@@ -12,6 +14,7 @@ import {
 import { encodeClientTurnRequestIdNumber } from "@cloudroom/domain";
 import type { Logger } from "@cloudroom/logger";
 import { createAiServiceRegistry } from "../../../src/services/ai/ai-service-registry.js";
+import { CodexAccounts } from "../../../src/services/cloudroom/codex-accounts.js";
 import {
   createPluginService,
   type PluginService,
@@ -24,13 +27,23 @@ import {
 import {
   buildExecutionOptions,
   buildThreadStartCommand,
+  prepareTurnSubmitCommandPayload,
 } from "../../../src/services/threads/thread-commands.js";
 import { textInput } from "../../helpers/prompt-input.js";
 import {
+  reportNextEnvironmentAttachSuccess,
+  waitForQueuedCommand,
+} from "../../helpers/commands.js";
+import { setPluginHookProvider } from "../../../src/services/plugins/plugin-hook-registry.js";
+import { createThreadFromRequest } from "../../../src/services/threads/thread-create.js";
+import { applyLoggedThreadLifecycleEvent } from "../../../src/services/threads/lifecycle-outcome.js";
+import {
+  seedEvent,
   seedEnvironment,
   seedHostSession,
   seedProjectWithSource,
   seedThread,
+  seedThreadRuntimeState,
 } from "../../helpers/seed.js";
 import {
   createTestAppHarness,
@@ -447,5 +460,280 @@ describe("plugin agent contributions reach thread runtime config", () => {
         source: { plugin: "env-second" },
       },
     ]);
+  });
+  // A new thread's composer pick (plugins/accounts) rides its first message: state a dispatch hook writes is what the
+  // first turn's environment reads, however slow the hook (the hook pass completes before the turn starts).
+  it("applies what a dispatch hook wrote for a new thread to its first turn's environment", async () => {
+    const root = await writePlugin(pluginsDir, {
+      name: "bb-plugin-first-turn-pin",
+      serverSource: `
+        export default function plugin(bb) {
+          const pins = new Map();
+          bb.experimental_hooks.on("message.dispatch", async ({ experimental_submission, thread }) => {
+            if (experimental_submission?.pluginId === bb.pluginId) {
+              await new Promise((resolve) => setTimeout(resolve, 50));
+              pins.set(thread.id, experimental_submission.data.id);
+            }
+            return { action: "proceed" };
+          });
+          bb.providers.experimental_contributeEnv("codex", (context) => [
+            { name: "PINNED", value: pins.get(context.threadId) ?? "default", reason: "Pin" },
+          ]);
+        }
+      `,
+    });
+    await harness.pluginService.installPath(root);
+    setPluginHookProvider(harness.pluginService.hooks);
+    try {
+      const { host } = seedHostSession(harness.deps, { id: "host-first-turn-pin" });
+      const { project } = seedProjectWithSource(harness.deps, { hostId: host.id });
+      const thread = await createThreadFromRequest(harness.deps, {
+        environment: {
+          type: "host",
+          hostId: host.id,
+          workspace: { type: "unmanaged", path: join(harness.config.dataDir, "first-turn-pin") },
+        },
+        input: textInput("hello"),
+        origin: "app",
+        pluginSubmission: { pluginId: "first-turn-pin", data: { id: "b" } },
+        projectId: project.id,
+        providerId: "codex",
+        startedOnBehalfOf: null,
+      });
+      await reportNextEnvironmentAttachSuccess(harness, thread.id);
+      const start = await waitForQueuedCommand(
+        harness,
+        ({ command }) => command.type === "thread.start" && command.threadId === thread.id,
+        5_000,
+      );
+      const env = (start.command as { contributedEnv?: { name: string; value: unknown }[] }).contributedEnv;
+      expect(env?.find((entry) => entry.name === "PINNED")?.value).toBe("b");
+    } finally {
+      setPluginHookProvider(undefined);
+    }
+  });
+
+  // Account plugins tie the login they hand out to the request a later turn.failed names (plugins/accounts).
+  it("names the turn request a command carries, and for a steer the running turn's request", async () => {
+    const root = await writePlugin(pluginsDir, {
+      name: "bb-plugin-env-request",
+      serverSource: `
+        export default function plugin(bb) {
+          bb.providers.experimental_contributeEnv("codex", (context) => [
+            {
+              name: "PLUGIN_REQUEST",
+              value: String(context.requestId) + ":" + String(context.runningTurnRequestId),
+              reason: "Expose the request",
+            },
+          ]);
+        }
+      `,
+    });
+    await harness.pluginService.installPath(root);
+    const { host } = seedHostSession(harness.deps, { id: "host-provider-request" });
+    const { project } = seedProjectWithSource(harness.deps, { hostId: host.id });
+    const environment = seedEnvironment(harness.deps, {
+      hostId: host.id,
+      projectId: project.id,
+      path: join(harness.config.dataDir, "provider-request-workspace"),
+    });
+    const thread = seedThread(harness.deps, {
+      projectId: project.id,
+      environmentId: environment.id,
+      providerId: "codex",
+    });
+    const execution = await buildExecutionOptions(harness.deps, { model: "gpt-5" }, { threadId: thread.id });
+    const named = (env: readonly { name: string; value: unknown }[]) =>
+      env.find((entry) => entry.name === "PLUGIN_REQUEST")?.value;
+    const started = encodeClientTurnRequestIdNumber({ value: 1 });
+    const start = await buildThreadStartCommand(harness.deps, {
+      environment,
+      execution,
+      fork: null,
+      permissionEscalation: "ask",
+      input: textInput("hello"),
+      projectId: project.id,
+      providerId: "codex",
+      requestId: started,
+      syncGeneratedTitle: false,
+      thread,
+    });
+    expect(named(start.contributedEnv)).toBe(`${started}:undefined`);
+    // The running turn accepted the first request.
+    seedThreadRuntimeState(harness.deps, {
+      environmentId: environment.id,
+      providerThreadId: "provider-session",
+      sequenceStart: 1,
+      threadId: thread.id,
+    });
+    seedEvent(harness.deps, {
+      threadId: thread.id,
+      environmentId: environment.id,
+      providerThreadId: "provider-session",
+      sequence: 3,
+      type: "turn/input/accepted",
+      scope: { kind: "turn", turnId: "turn-1" },
+      data: { providerThreadId: "provider-session", clientRequestId: started },
+    });
+    const submit = async (
+      target: Parameters<typeof prepareTurnSubmitCommandPayload>[1]["target"],
+      requestId?: number,
+    ) =>
+      named(
+        (
+          await prepareTurnSubmitCommandPayload(harness.deps, {
+            environment,
+            execution,
+            input: textInput("more"),
+            permissionEscalation: "ask",
+            providerThreadId: "provider-session",
+            target,
+            thread,
+            ...(requestId === undefined
+              ? {}
+              : { requestId: encodeClientTurnRequestIdNumber({ value: requestId }) }),
+          })
+        ).resumeContext.contributedEnv,
+      );
+    const next = (value: number) => encodeClientTurnRequestIdNumber({ value });
+    expect(await submit({ mode: "start" }, 2)).toBe(`${next(2)}:undefined`);
+    expect(await submit({ mode: "steer", expectedTurnId: "turn-1" }, 3)).toBe(`${next(3)}:${started}`);
+    // An "auto" send aimed at the running turn (a child's report) joins it like a steer.
+    expect(await submit({ mode: "auto", expectedTurnId: "turn-1" }, 5)).toBe(`${next(5)}:${started}`);
+    // A turn that accepted nothing known, an "auto" send naming no turn, and a command with no request name none.
+    expect(await submit({ mode: "steer", expectedTurnId: "turn-gone" }, 4)).toBe("undefined:undefined");
+    expect(await submit({ mode: "auto", expectedTurnId: "turn-gone" }, 6)).toBe("undefined:undefined");
+    expect(await submit({ mode: "auto", expectedTurnId: null }, 7)).toBe("undefined:undefined");
+    expect(await submit({ mode: "start" })).toBe("undefined:undefined");
+  });
+
+  // Only the bundled accounts plugin, which no test can install, may name the Codex account.
+  it("ignores a Codex account pin from any other plugin, and never passes the variable on", async () => {
+    const root = await writePlugin(pluginsDir, {
+      name: "bb-plugin-impostor",
+      serverSource: `
+        export default function plugin(bb) {
+          bb.providers.experimental_contributeEnv("codex", () => [
+            { name: "CLOUDROOM_CODEX_ACCOUNT", value: "b", reason: "Pin" },
+          ]);
+        }
+      `,
+    });
+    await harness.pluginService.installPath(root);
+    const pinned = vi.spyOn(CodexAccounts.prototype, "environment").mockResolvedValue([]);
+    try {
+      const { host } = seedHostSession(harness.deps, { id: "host-codex-pin" });
+      const { project } = seedProjectWithSource(harness.deps, { hostId: host.id });
+      const environment = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        projectId: project.id,
+        path: join(harness.config.dataDir, "codex-pin-workspace"),
+      });
+      const thread = seedThread(harness.deps, {
+        projectId: project.id,
+        environmentId: environment.id,
+        providerId: "codex",
+      });
+      const execution = await buildExecutionOptions(harness.deps, { model: "gpt-5" }, { threadId: thread.id });
+      const command = await prepareTurnSubmitCommandPayload(harness.deps, {
+        environment,
+        execution,
+        input: textInput("hello"),
+        permissionEscalation: "ask",
+        providerThreadId: "provider-session",
+        target: { mode: "start" },
+        thread,
+      });
+      expect(pinned).toHaveBeenCalledWith(undefined);
+      expect(command.resumeContext.contributedEnv.map((entry) => entry.name)).not.toContain("CLOUDROOM_CODEX_ACCOUNT");
+    } finally {
+      pinned.mockRestore();
+    }
+  });
+  // The events are built a tick later, when Teleport may have moved the thread and a newer request may have landed:
+  // what ran is read when the turn ended.
+  it("keeps a turn's request and target as they were when it ended", async () => {
+    const root = await writePlugin(pluginsDir, {
+      name: "bb-plugin-turn-snapshots",
+      serverSource: `
+        export default function plugin(bb) {
+          globalThis.__turnSnapshots = [];
+          for (const name of ["thread.idle", "turn.failed"])
+            bb.events.on(name, (payload) => {
+              globalThis.__turnSnapshots.push({
+                name,
+                requestId: payload.requestId ?? payload.experimental_requestId,
+                target: payload.experimental_executionTarget,
+              });
+            });
+        }
+      `,
+    });
+    await harness.pluginService.installPath(root);
+    const { host } = seedHostSession(harness.deps, { id: "host-turn-snapshots" });
+    const { project } = seedProjectWithSource(harness.deps, { hostId: host.id });
+    const environment = seedEnvironment(harness.deps, { hostId: host.id, projectId: project.id });
+    const snapshots = () =>
+      (globalThis as { __turnSnapshots?: unknown[] }).__turnSnapshots ?? [];
+    const settled = () => new Promise((done) => setTimeout(done, 20));
+    let next = 1;
+    const turn = () => {
+      const thread = seedThread(harness.deps, {
+        projectId: project.id,
+        environmentId: environment.id,
+        status: "active",
+      });
+      const requestId = encodeClientTurnRequestIdNumber({ value: next });
+      seedThreadRuntimeState(harness.deps, {
+        environmentId: environment.id,
+        providerThreadId: "provider-session",
+        sequenceStart: next,
+        threadId: thread.id,
+      });
+      next += 2;
+      // A newer request, as a later send or retry appends one, before the event is built.
+      const advance = () => {
+        seedThreadRuntimeState(harness.deps, {
+          environmentId: environment.id,
+          providerThreadId: "provider-session",
+          sequenceStart: next,
+          threadId: thread.id,
+        });
+        next += 2;
+      };
+      const teleport = () =>
+        harness.db.update(threads).set({ executionTarget: "cloud" }).where(eq(threads.id, thread.id)).run();
+      const end = (type: "run.succeeded" | "run.failed") =>
+        applyLoggedThreadLifecycleEvent(harness.deps, { event: { type }, threadId: thread.id });
+      return { requestId, advance, teleport, end };
+    };
+
+    const idle = turn();
+    idle.end("run.succeeded");
+    idle.advance();
+    await settled();
+    expect(snapshots()).toEqual([{ name: "thread.idle", requestId: idle.requestId }]);
+
+    // Moved to Cloud right after its Local failure: it still ran Local.
+    const moved = turn();
+    moved.end("run.failed");
+    moved.teleport();
+    await settled();
+    expect(snapshots().at(-1)).toEqual({ name: "turn.failed", requestId: moved.requestId, target: "local" });
+
+    // A newer request landed first: that work overtook the failure, which is not announced at all.
+    const before = snapshots().length;
+    const overtaken = turn();
+    overtaken.end("run.failed");
+    overtaken.advance();
+    await settled();
+    expect(snapshots()).toHaveLength(before);
+
+    // A failure applied while the thread is in Cloud ran there.
+    const cloud = turn();
+    cloud.teleport();
+    cloud.end("run.failed");
+    await settled();
+    expect(snapshots().at(-1)).toEqual({ name: "turn.failed", requestId: cloud.requestId, target: "cloud" });
   });
 });

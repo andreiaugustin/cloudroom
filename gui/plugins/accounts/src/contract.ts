@@ -6,6 +6,9 @@ export type Provider = z.infer<typeof providerSchema>;
 export const MAX_ACCOUNTS = 10;
 export const LOCAL = "local";
 export const ACCOUNTS_CHANGED = "accounts-changed";
+// A Local Codex thread pinned to an account names it here; the app swaps it for that account's sign-in.
+// Keep in sync with apps/server/src/services/threads/thread-runtime-config.ts.
+export const CODEX_ACCOUNT_ENV = "CLOUDROOM_CODEX_ACCOUNT";
 
 export const usageWindowSchema = z.object({
   label: z.string(),
@@ -32,6 +35,22 @@ export const accountViewSchema = z.object({
   limitedLogin: z.boolean(),
 });
 export type AccountView = z.infer<typeof accountViewSchema>;
+
+export const threadAccountsSchema = z.object({
+  provider: providerSchema,
+  accounts: z.array(z.object({ id: z.string(), label: z.string() })),
+  // The default every unpinned thread uses.
+  default: z.string(),
+  thread: z.string().nullable(),
+  project: z.string().nullable(),
+  // Cloud threads use the default account: Cloud keeps one login per agent (ADR 0197).
+  cloud: z.boolean(),
+});
+export type ThreadAccounts = z.infer<typeof threadAccountsSchema>;
+
+// A new thread's own pick, sent with its first message (useComposer().experimental_setSubmissionData). The
+// message.dispatch hook pins it before that message's turn starts.
+export const pendingPinSchema = z.object({ provider: providerSchema, id: z.string().min(1) });
 
 const target = z.object({ provider: providerSchema, id: z.string().min(1) });
 const ok = z.null();
@@ -86,6 +105,34 @@ export const accountsRpcContract = defineRpcContract({
   },
   // Cursor accounts are added with a user API key from cursor.com/dashboard.
   "cursor.add": { input: z.object({ apiKey: z.string().max(4096) }), output: ok },
+  // The account a thread runs on: its own pick, else its project's, else the default (the top account). Null for an
+  // agent without accounts here.
+  "accounts.thread": {
+    // A new thread's composer has no thread yet: it names the project and the agent picked.
+    input: z.union([
+      z.object({ threadId: z.string().min(1) }),
+      z.object({ projectId: z.string().min(1), provider: providerSchema }),
+    ]),
+    output: threadAccountsSchema.nullable(),
+  },
+  // Pins the thread's agent to an account for this thread or its whole project; null follows the default again.
+  "accounts.pin": {
+    input: z.union([
+      z.object({
+        threadId: z.string().min(1),
+        scope: z.enum(["thread", "project"]),
+        id: z.string().min(1).nullable(),
+      }),
+      // From a new thread's composer: only the project pin, the thread's own pick goes with its first message.
+      z.object({
+        projectId: z.string().min(1),
+        provider: providerSchema,
+        scope: z.literal("project"),
+        id: z.string().min(1).nullable(),
+      }),
+    ]),
+    output: ok,
+  },
   "claude.poll": { input: poll, output: polled },
   "codex.poll": { input: poll, output: polled },
 });

@@ -857,15 +857,26 @@ export function createPluginRuntime(context: PluginRuntimeContext) {
    * The builder runs only when a handler is listening, so that second look
    * costs nothing on a stock install.
    */
-  function emitThreadEvent<E extends PluginThreadEventName>(
+  /** `capture` runs now, and only with a listener, for facts the payload must reflect as they are at emit time. */
+  function emitThreadEvent<E extends PluginThreadEventName, C = undefined>(
     event: E,
-    buildPayload: () => PluginThreadEventPayloads[E] | null,
+    buildPayload: (captured: C) => PluginThreadEventPayloads[E] | null,
+    capture?: () => C,
   ): void {
     if (!hasThreadEventHandlers(event)) return;
+    let captured: C;
+    try {
+      captured = capture ? capture() : (undefined as C);
+    } catch (error) {
+      logger.warn(
+        `failed to capture ${event} plugin event facts: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return;
+    }
     setImmediate(() => {
       let payload: PluginThreadEventPayloads[E] | null;
       try {
-        payload = buildPayload();
+        payload = buildPayload(captured);
       } catch (error) {
         logger.warn(
           `failed to build ${event} plugin event payload: ${error instanceof Error ? error.message : String(error)}`,

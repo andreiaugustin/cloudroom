@@ -52,7 +52,16 @@ experimental_openFilePreview(options), experimental_openFileExternally(options) 
   to one of YOUR `bb.ui.registerMentionProvider` providers, resolved to
   fresh context at send time; `focus()` focuses the caret. The `scope` is
   `thread`, `queued-message`, `side-chat`, or `new-thread`, with the identifiers
-  for that surface. `experimental_submit({ sendAt })` submits through the
+  for that surface. A `new-thread` scope also reports the picked agent
+  (`experimental_providerId`, null while none) and where the thread will run
+  (`experimental_executionTarget`: `"local"` for this or another machine,
+  `"cloud"` for a cloud sandbox); both may be absent on other hosts.
+  `experimental_setSubmissionData(data | null)` (new-thread composers) holds
+  plugin JSON that the user's ordinary sends carry to `message.dispatch` hooks
+  as `experimental_submission`, until cleared or the composer goes away; the
+  hook runs before the new thread's first turn, so state it writes applies to
+  that turn. Clear it in your effect's cleanup. Not sent with a Cloud target;
+  the first plugin to set data wins. `experimental_submit({ sendAt })` submits through the
   composer's own pipeline at a future time. `experimental_submit({
 experimental_data })` submits now and carries plugin-owned JSON to dispatch
   hooks on the initial attempt; cloudroom automatically namespaces it with the
@@ -90,8 +99,9 @@ banners?, richText? })`. Omitted `scopes` means all thread, queued-message,
   side-chat, and new-thread composers.
 - `actions` and `banners` are plugin React components. Calls to
   `useComposer()` and `useComposerView()` inside them are bound to the composer
-  that mounted the component. Actions render before native voice/submit and
-  are unavailable in compact layout; banners render above the composer.
+  that mounted the component. Actions render after the agent and model
+  pickers and are unavailable in compact layout; banners render above the
+  composer.
   A banner's `chrome` is `"card"` by default or `"bare"`.
 - `plusMenu` rows are host-rendered so keyboard navigation, focus restoration,
   and mobile layout remain correct. Each `ComposerPlusMenuItem` supplies

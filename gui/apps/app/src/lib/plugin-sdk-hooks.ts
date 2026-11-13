@@ -853,6 +853,12 @@ export function useComposer(): PluginComposerApi {
     [hostSubmit, pluginId, scopeOwnership],
   );
 
+  const hostSetSubmissionData = composerHost?.setSubmissionData;
+  const experimental_setSubmissionData = useCallback(
+    (data: JsonValue | null) => hostSetSubmissionData?.(pluginId, data),
+    [hostSetSubmissionData, pluginId],
+  );
+
   const view = useComposerView();
   return useMemo(
     (): CloudroomComposerApi => ({
@@ -887,6 +893,7 @@ export function useComposer(): PluginComposerApi {
       },
       selection: null,
       submit: experimental_submit,
+      experimental_setSubmissionData,
       experimental_openPopup: () => false,
       experimental_closePopup: () => false,
     }),
@@ -897,6 +904,7 @@ export function useComposer(): PluginComposerApi {
       composerScope,
       composerText,
       experimental_submit,
+      experimental_setSubmissionData,
       focus,
       getCurrent,
       insertMention,

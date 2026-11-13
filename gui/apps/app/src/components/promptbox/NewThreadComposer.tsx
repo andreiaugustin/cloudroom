@@ -402,6 +402,19 @@ export function restorePromptDraftAfterOptionChange({
   return changed ? restoredDraft : null;
 }
 
+/** The plugin data a send carries: a plugin's own submit, else the first held one. Cloud takes none. */
+export function submittedPluginData(
+  explicit: NewThreadComposerSubmission["pluginSubmission"],
+  held: ReadonlyMap<string, JsonValue>,
+  executionTarget: "local" | "cloud",
+): NewThreadComposerSubmission["pluginSubmission"] {
+  if (explicit !== undefined) return explicit;
+  const [first] = held;
+  return executionTarget === "cloud" || first === undefined
+    ? undefined
+    : { pluginId: first[0], data: first[1] };
+}
+
 export function useDraftPreservingOptionChange<T>(
   current: T,
   setValue: (value: T) => void,
@@ -1547,19 +1560,37 @@ export function NewThreadComposer({
     ) => submitProgrammaticallyRef.current(options, pluginSubmission),
     [],
   );
+  // Plugin data for ordinary sends, in the order plugins set it (experimental_setSubmissionData).
+  const submissionDataRef = useRef(new Map<string, JsonValue>());
+  const setSubmissionData = useCallback(
+    (pluginId: string, data: JsonValue | null) => {
+      if (data === null) submissionDataRef.current.delete(pluginId);
+      else submissionDataRef.current.set(pluginId, data);
+    },
+    [],
+  );
   const pluginComposerHost = useMemo<PluginComposerHost>(
     () => ({
-      scope: { kind: "new-thread", projectId },
+      scope: {
+        kind: "new-thread",
+        projectId,
+        experimental_providerId: selectedProviderId ?? null,
+        experimental_executionTarget: executionTarget,
+      },
       textEffectKey: promptDraft.storageKey,
       getCurrent: promptDraft.getCurrent,
       subscribeDraft: promptDraft.subscribe,
       setDraft: promptDraft.setDraft,
       focus: focusPromptBox,
       submit: submitProgrammaticallyThroughRef,
+      setSubmissionData,
     }),
     [
+      executionTarget,
       focusPromptBox,
       projectId,
+      selectedProviderId,
+      setSubmissionData,
       promptDraft.getCurrent,
       promptDraft.setDraft,
       promptDraft.storageKey,
@@ -1682,6 +1713,11 @@ export function NewThreadComposer({
               : "This composer is not ready to submit yet."),
         );
       }
+      const held = submittedPluginData(
+        pluginSubmission,
+        submissionDataRef.current,
+        executionTarget,
+      );
       const sources: CreateExecutionInputSources = {
         ...executionInputSources,
         ...seededExecutionInputSources,
@@ -1706,7 +1742,7 @@ export function NewThreadComposer({
         ...(submitOptions?.sendAt === undefined
           ? {}
           : { sendAt: submitOptions.sendAt }),
-        ...(pluginSubmission === undefined ? {} : { pluginSubmission }),
+        ...(held === undefined ? {} : { pluginSubmission: held }),
       };
       if (executionTarget === "cloud")
         request.requestId = await cloudroomRequestId(

@@ -52,6 +52,7 @@ export interface ComposerHandleTarget {
     pluginSubmission: { pluginId: string; data: JsonValue } | undefined,
   ): Promise<void>;
   setSelection?(selection: ComposerSelection): Promise<ComposerSelection>;
+  setSubmissionData?(pluginId: string, data: JsonValue | null): void;
 }
 
 export interface ComposerHandleController {
@@ -447,6 +448,8 @@ export function createComposerHandleBinding(
       target().closePopup?.(controller.pluginId) ?? false,
     submit,
     setSelection,
+    experimental_setSubmissionData: (data) =>
+      target().setSubmissionData?.(controller.pluginId, data),
     experimental_removeMention: (mention) => {
       warnDeprecatedComposerMember("experimental_removeMention", "replace");
       if (!legacyAvailable("experimental_removeMention")) return;

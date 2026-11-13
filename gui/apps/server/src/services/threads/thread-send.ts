@@ -779,6 +779,7 @@ async function sendThreadMessageWithoutContextClear(
   });
   const preparedCommand = await prepareTurnSubmitCommandPayload(deps, {
     thread,
+    requestId,
     input,
     ...(inputGroups !== undefined ? { inputGroups } : {}),
     execution,

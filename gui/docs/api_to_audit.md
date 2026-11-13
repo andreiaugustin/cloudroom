@@ -90,7 +90,12 @@ a literal string or a server-relative path that the host expands against its
 authenticated `BB_SERVER_URL`. Contributions override the shell environment and
 their values are reported as-is in provider environment events. The resolver
 receives `ExperimentalPluginProviderEnvContext` and returns
-`ExperimentalPluginProviderEnvEntry` values.
+`ExperimentalPluginProviderEnvEntry` values. The context's optional
+`requestId` and `runningTurnRequestId` tie a turn command's environment to the
+request a later `turn.failed` names. A steer, and an "auto" send aimed at a
+running turn (parent notices included), pass both; if that turn ended before
+the command lands, the new turn runs on this environment while
+`runningTurnRequestId` still names the old one.
 
 **Audit before stabilizing.**
 
@@ -105,6 +110,9 @@ receives `ExperimentalPluginProviderEnvContext` and returns
    stable machine-readable purpose beside it.
 6. Decide whether the context and entry types should stabilize with the method
    or remain experimental for a longer compatibility window.
+7. Decide whether every turn command (retries made inside a transaction,
+   "auto" sends with no running turn named) should make its request id before
+   the build, so `requestId` is never missing for a turn.
 
 Every public plugin API member ships with an `experimental_` prefix and an
 entry here (see [AGENTS.md](../AGENTS.md), "Plugin API"). Dropping the prefix
@@ -407,7 +415,10 @@ one.
 `turn.failed` fires after a turn failed and the thread has landed in `error`. It
 carries ids and failure facts only — `threadId`, the failed turn's `requestId`,
 the provider `turnId`, the provider's `ProviderErrorInfo`, the latest
-`ProviderRateLimitState`, `attemptNumber`, `interruptionReason` and `turnStartedBeforeBoot` — and no thread DTO or copy of the
+`ProviderRateLimitState`, `attemptNumber`, `interruptionReason`, `turnStartedBeforeBoot` and
+`experimental_executionTarget` (where the failed request ran, read when core
+applied the failure; a failure a newer request overtook before the event was
+built is not announced) — and no thread DTO or copy of the
 message, because a retry is asked for by reference with
 `bb.sdk.threads.retry({ threadId, turnRequestId, sendAt })` and anything else is
 one `threads.get` away and fresher for being read when it is used. It is an
@@ -428,7 +439,12 @@ already distinguishes the two. `message.cancelled` fires when a queued row is
 deleted before it dispatched (the queued card's Delete, `bb thread queue`);
 rows that vanish with their thread fire the thread event instead. Confirm
 that split is the teardown signal a plugin holding resources for a waiting
-message needs before this is stable. For `turn.failed`, confirm the payload answers every
+message needs before this is stable. `thread.idle` carries
+`experimental_requestId`, the thread's last request when it went idle; a Cloud
+handoff appends none, so on a Cloud thread it can name an earlier Local one.
+Decide whether it should name only Local turns, or carry its own target. For
+`turn.failed`, decide whether Cloud failures should be announced too, with
+`experimental_executionTarget: "cloud"`, and confirm the payload answers every
 question a retry policy asks without replaying the event log, and note that
 attempt caps are entirely the plugin's: core enforces no ceiling on retry chains
 beyond one live retry row per original request.
@@ -2648,6 +2664,39 @@ the same image paths and URLs used by ordinary prompt inputs before dispatch.
 providers need, the 50-image boundary is appropriate, and local image access
 should remain governed by the thread dispatch validator rather than an earlier
 plugin-specific check.
+
+## `useComposer().experimental_setSubmissionData` and the new-thread scope's `experimental_providerId` / `experimental_executionTarget`
+
+**What it does.** A `new-thread` composer scope reports the picked agent
+(`experimental_providerId`, null while none) and where the thread will run
+(`experimental_executionTarget`, `"local"` or `"cloud"`), so a composer action
+can depend on them before a thread exists. `experimental_setSubmissionData(data
+| null)` holds plugin JSON in a new-thread composer; the user's ordinary sends
+carry it as the create request's `pluginSubmission`, which reaches
+`message.dispatch` hooks as `experimental_submission` on the first dispatch,
+before the first turn starts (and so before provider env resolution). Backed by
+an optional `setSubmissionData` on the internal `PluginComposerHost`, supplied
+only by the new-thread composer; elsewhere it is a no-op. Consumer:
+`plugins/accounts` (a new thread's own account pick, pinned by its hook).
+
+**Audit before stabilizing.**
+
+1. **One envelope per send.** The request carries a single `pluginSubmission`,
+   so when several plugins hold data the first one set wins and the rest are
+   dropped silently; a plugin's own `submit({ experimental_data })` replaces
+   held data. Decide whether the envelope should become a list keyed by plugin.
+2. **Lifetime.** Data stays until cleared or the composer unmounts, so it rides
+   every send from that composer, not just the next one. Decide whether a send
+   should clear it, which would need an `onSubmitted` the Cloudroom composer
+   does not implement yet.
+3. **Cloud.** Cloud thread creation rejects `pluginSubmission`, so the host
+   drops held data for a Cloud target. Decide whether Cloud creation should
+   accept it.
+4. **Scope shape.** The two scope fields widen a union that is also an identity
+   key; confirm they belong on `scope` rather than on `selection`, which the
+   Cloudroom composer reports as null today.
+5. **Phone starting screen.** A send carrying plugin data skips the
+   compact-viewport "starting thread" screen, as plugin submits always have.
 
 ## `useComposer().experimental_submit` and dispatch `experimental_submission`
 

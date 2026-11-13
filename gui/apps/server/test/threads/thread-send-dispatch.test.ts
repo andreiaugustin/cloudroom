@@ -1017,6 +1017,39 @@ describe("startup queue waits", () => {
     });
   });
 
+  // Provider env resolvers tie the notice to the turn it joins, so its command is built with the id it is sent with.
+  it("builds an active parent's notice with the request id the command carries", async () => {
+    await withTestHarness(async (harness) => {
+      const { environment, thread } = seedProviderThreadFixture({
+        harness,
+        status: "active",
+        value: 1343,
+      });
+      seedTurnStarted(harness.deps, {
+        environmentId: environment.id,
+        providerThreadId: "provider-send-dispatch-1343",
+        threadId: thread.id,
+        turnId: "turn-1343",
+      });
+      const prepare = vi.spyOn(threadCommands, "prepareTurnSubmitCommandPayload");
+      await expect(
+        queueParentSystemMessage(harness.deps, {
+          input: textInput("child finished"),
+          parentThreadId: thread.id,
+          systemMessageKind: "child-completed",
+          systemMessageSubject: null,
+        }),
+      ).resolves.toBe(true);
+      const sent = listQueuedThreadCommands(harness, "turn.submit", thread.id);
+      expect(sent).toEqual([
+        expect.objectContaining({ target: { mode: "auto", expectedTurnId: "turn-1343" } }),
+      ]);
+      const requestId = sent[0]?.type === "turn.submit" ? sent[0].requestId : null;
+      expect(requestId).toEqual(expect.any(String));
+      expect(prepare).toHaveBeenCalledWith(harness.deps, expect.objectContaining({ requestId }));
+    });
+  });
+
   it("keeps a child report when the parent's turn ends while it prepares (#1341)", async () => {
     await withTestHarness(async (harness) => {
       const { environment, thread } = seedProviderThreadFixture({

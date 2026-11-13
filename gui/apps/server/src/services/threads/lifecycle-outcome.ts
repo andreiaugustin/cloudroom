@@ -15,6 +15,7 @@ import {
 import type { ProviderRegistryService } from "../providers/provider-registry.js";
 import { noteTurnFailed } from "../system/auth-failure-telemetry.js";
 import { buildThreadStatusChangeMetadata } from "./thread-runtime-display.js";
+import { loadFailedTurn } from "./turn-failed.js";
 
 /**
  * `run.failed` is the only event that lands a thread in `error`, so an applied
@@ -27,11 +28,18 @@ import { buildThreadStatusChangeMetadata } from "./thread-runtime-display.js";
  * handled.
  */
 function announceTurnFailed(
+  db: DbConnection | DbTransaction,
   args: ApplyThreadLifecycleEventArgs,
   outcome: ApplyThreadLifecycleEventOutcome,
 ): void {
   if (!outcome.applied || args.event.type !== "run.failed") return;
-  emitPluginTurnFailed(args.threadId);
+  // The event is built after this returns, when Teleport may already have moved the thread: where the failed request
+  // ran is read now.
+  emitPluginTurnFailed(args.threadId, () => ({
+    requestId: loadFailedTurn(db, args.threadId)?.request.requestId ?? null,
+    executionTarget:
+      outcome.thread.executionTarget === "cloud" ? "cloud" : "local",
+  }));
   noteTurnFailed(args.threadId);
 }
 
@@ -80,7 +88,7 @@ export function applyLoggedThreadLifecycleEvent(
   }
   logUnappliedThreadLifecycleEvent(deps.logger, args, outcome);
   emitPluginThreadLifecycleOutcome(outcome);
-  announceTurnFailed(args, outcome);
+  announceTurnFailed(deps.db, args, outcome);
   return outcome;
 }
 
@@ -91,6 +99,6 @@ export function applyLoggedThreadLifecycleEventInTransaction(
   const outcome = applyThreadLifecycleEventInTransaction(deps.db, args);
   logUnappliedThreadLifecycleEvent(deps.logger, args, outcome);
   emitPluginThreadLifecycleOutcome(outcome);
-  announceTurnFailed(args, outcome);
+  announceTurnFailed(deps.db, args, outcome);
   return outcome;
 }

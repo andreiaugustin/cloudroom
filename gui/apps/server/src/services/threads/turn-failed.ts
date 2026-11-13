@@ -6,6 +6,7 @@ import {
   listStoredTurnInputAcceptedRowsByClientRequestIds,
   listStoredTurnRejectedRowsByClientRequestIds,
   type DbConnection,
+  type DbQueryConnection,
   type StoredThreadEventDataRow,
 } from "@cloudroom/db";
 import {
@@ -63,7 +64,7 @@ export interface FailedTurnRecord {
  * where there is nothing to announce and nothing for a retry to re-submit.
  */
 export function loadFailedTurn(
-  db: DbConnection,
+  db: DbQueryConnection,
   threadId: string,
 ): FailedTurnRecord | null {
   const row = getLastStoredTurnRequestEvent(db, threadId);
@@ -171,9 +172,17 @@ function doorRejectionErrorInfo(
  * Returns null when the thread is gone or never dispatched a turn — there is
  * no failed turn to announce.
  */
+/** What was true when core applied a turn's failure: the request that failed and where the thread ran it. The event
+ *  is built later, after Teleport may have moved the thread or a newer request landed. */
+export interface TurnFailedOrigin {
+  requestId: string | null;
+  executionTarget: "local" | "cloud";
+}
+
 export function buildTurnFailedEvent(
   db: DbConnection,
   threadId: string,
+  origin?: TurnFailedOrigin,
 ): PluginTurnFailedEvent | null {
   const thread = getThread(db, threadId);
   if (!thread || thread.deletedAt !== null || thread.archivedAt !== null) {
@@ -181,6 +190,9 @@ export function buildTurnFailedEvent(
   }
   const failed = loadFailedTurn(db, threadId);
   if (failed === null) return null;
+  // A newer request landed between the failure and this build: that work overtook the failure, which is no longer the
+  // thread's to announce, and naming the newer request would pin the failure on it.
+  if (origin && origin.requestId !== failed.request.requestId) return null;
   const providerError = loadProviderError(db, { threadId, failed });
   return {
     threadId,
@@ -196,6 +208,7 @@ export function buildTurnFailedEvent(
     turnStartedBeforeBoot:
       thread.executionTarget !== "cloud" &&
       failed.requestedAt < Date.now() - os.uptime() * 1_000,
+    ...(origin ? { experimental_executionTarget: origin.executionTarget } : {}),
   };
 }
 

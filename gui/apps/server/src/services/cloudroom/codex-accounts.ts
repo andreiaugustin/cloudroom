@@ -81,10 +81,12 @@ export class CodexAccounts {
     private readonly switched: () => void,
   ) {}
 
-  /** The selected account's sign-in for a Local Codex thread. None means the Mac's own `~/.codex` login. */
-  async environment(): Promise<HostDaemonContributedEnvEntry[]> {
-    const state = await this.load().catch(() => null);
-    const account = state?.accounts.find(each => each.id === state.selected);
+  /** The sign-in for a Local Codex thread: its pinned account (`local` is the Mac's own), else the selected one, else
+   *  none, which means the Mac's own `~/.codex` login. A pin to a removed account falls back to the selected one. */
+  async environment(pinned?: string): Promise<HostDaemonContributedEnvEntry[]> {
+    if (pinned === "local") return [];
+    const state = await this.load(false, pinned).catch(() => null);
+    const account = state?.accounts.find(each => each.id === pinned) ?? state?.accounts.find(each => each.id === state.selected);
     if (!account) return [];
     const reason = `Cloudroom Codex account ${account.email ?? account.id}`, source = { core: "machine-environment" as const };
     return [
@@ -141,8 +143,9 @@ export class CodexAccounts {
     };
   }
 
-  /** The website's list, at most every 10 minutes with accounts (an hour without), or sooner if a token is close to expiry. */
-  private async load(force = false): Promise<Cached | null> {
+  /** The website's list, at most every 10 minutes with accounts (an hour without), or sooner if the selected token, or
+   *  the `pinned` account's, is close to expiry. */
+  private async load(force = false, pinned?: string): Promise<Cached | null> {
     const userId = await this.user();
     if (!userId) {
       if (this.cached !== null) { this.cached = null; await rm(this.path, { force: true }).catch(() => {}); }
@@ -150,8 +153,11 @@ export class CodexAccounts {
     }
     if (this.cached === undefined) this.cached = await readFile(this.path, "utf8").then(text => JSON.parse(text) as Cached, () => null);
     const cached = this.cached?.userId === userId ? this.cached : null;
-    const selected = cached?.accounts.find(each => each.id === cached.selected);
-    const fresh = cached && Date.now() - cached.at < (cached.accounts.length ? 10 : 60) * 60_000 && (!selected?.expiresAt || selected.expiresAt - Date.now() > TOKEN_MARGIN_MS);
+    const expiring = (id: string | null | undefined) => {
+      const expiresAt = cached?.accounts.find(each => each.id === id)?.expiresAt;
+      return !!expiresAt && expiresAt - Date.now() <= TOKEN_MARGIN_MS;
+    };
+    const fresh = cached && Date.now() - cached.at < (cached.accounts.length ? 10 : 60) * 60_000 && !expiring(cached.selected) && !expiring(pinned);
     if (fresh && !force) return cached;
     this.loading ??= this.remember(userId, { action: "list" }).finally(() => { this.loading = null; });
     return this.loading.catch((error: unknown) => { if (cached && !force) return cached; throw error; });

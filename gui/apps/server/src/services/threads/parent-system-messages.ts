@@ -6,6 +6,7 @@ import {
   type DbTransaction,
 } from "@cloudroom/db";
 import type {
+  ClientTurnRequestId,
   PromptInput,
   PromptMentionResource,
   PromptTextMention,
@@ -148,6 +149,7 @@ function throwIfStopHoldsNotice(
 
 interface QueueActiveParentSystemMessageInTransactionArgs extends QueueReadyParentSystemMessageArgs {
   preparedCommand: PreparedTurnSubmitCommandPayload;
+  requestId: ClientTurnRequestId;
 }
 
 function parentSystemTurnRequestFields(
@@ -266,6 +268,7 @@ function queueActiveParentSystemMessageInTransaction(
   const expectedSteerTurnId = getActiveTurnId({ db: tx }, args.thread.id);
   const request = appendClientTurnEventInTransaction(tx, {
     ...parentSystemTurnRequestFields(args),
+    requestId: args.requestId,
     target: {
       kind: "auto",
       expectedTurnId: expectedSteerTurnId,
@@ -317,8 +320,11 @@ async function queueActiveParentSystemMessage(
   await ensureHostSessionReadyForWork(deps, {
     hostId: args.environment.hostId,
   });
+  // Made before the command is built, so provider env resolvers can tie this notice to the turn it joins.
+  const requestId = createClientTurnRequestId();
   const preparedCommand = await prepareTurnSubmitCommandPayload(deps, {
     thread: args.thread,
+    requestId,
     input: args.input,
     execution: args.execution,
     permissionEscalation: "ask",
@@ -339,6 +345,7 @@ async function queueActiveParentSystemMessage(
       queueActiveParentSystemMessageInTransaction(tx, {
         ...args,
         preparedCommand,
+        requestId,
       }),
     { behavior: "immediate" },
   );

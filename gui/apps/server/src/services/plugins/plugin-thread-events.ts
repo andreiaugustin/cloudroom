@@ -1,6 +1,7 @@
 import type { ApplyThreadLifecycleEventOutcome } from "@cloudroom/db";
 import type { PendingInteraction, Thread } from "@cloudroom/domain";
 import type { ThreadQueuedMessage } from "@cloudroom/domain";
+import type { TurnFailedOrigin } from "../threads/turn-failed.js";
 import type { PluginThreadEventEmitter } from "./plugin-service.js";
 
 const pendingThreadEvents = new Map<string, ReturnType<typeof setTimeout>>();
@@ -64,8 +65,11 @@ export function emitPluginMessageCancelled(entry: ThreadQueuedMessage): void {
  * why, which is what a retry policy decides on. Both are announcements — the
  * failure stands either way — so neither can block the seam.
  */
-export function emitPluginTurnFailed(threadId: string): void {
-  emitter?.emitTurnFailed(threadId);
+export function emitPluginTurnFailed(
+  threadId: string,
+  origin?: () => TurnFailedOrigin,
+): void {
+  emitter?.emitTurnFailed(threadId, origin);
 }
 
 /**

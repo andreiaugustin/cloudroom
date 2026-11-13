@@ -2657,6 +2657,10 @@ export type PluginComposerScope =
       kind: "new-thread";
       /** Root compose's effective selected project; null only while unresolved. */
       projectId: string | null;
+      /** The agent picked for the new thread; null while none is selected. Absent on hosts that don't report it. */
+      experimental_providerId?: string | null;
+      /** Where the new thread will run: this machine or another one (`"local"`), or a cloud sandbox (`"cloud"`). Absent on hosts that don't report it. */
+      experimental_executionTarget?: "local" | "cloud";
     };
 
 /** One plugin-owned composer customization registration. */
@@ -3109,6 +3113,17 @@ export interface PluginComposerApi {
    * mode, or is an empty service tier.
    */
   setSelection(selection: ComposerSelection): Promise<ComposerSelection>;
+  /**
+   * New-thread composers: attach opaque JSON from this plugin to the user's
+   * ordinary sends (Enter, the send button) until cleared with null or the
+   * composer goes away. A `message.dispatch` hook receives it as
+   * `experimental_submission` on the new thread's first dispatch, before the
+   * first turn starts, so state written there applies to that turn. A
+   * `submit({ experimental_data })` call carries its own data instead. When
+   * several plugins hold data, the first one set is sent. Not sent with a
+   * Cloud target. A no-op in other composers.
+   */
+  experimental_setSubmissionData(data: JsonValue | null): void;
   /** @internal Old name of `removeMention`; kept for plugins built against older SDKs. */
   experimental_removeMention(mention: { provider: string; id: string }): void;
   /** @internal Old name of `onSubmitted`; kept for plugins built against older SDKs. */

@@ -1043,6 +1043,7 @@ export async function prepareReadyThreadTurnCommand(
         : {}),
       permissionEscalation: args.permissionEscalation,
       providerThreadId,
+      requestId: args.requestId,
       target: { mode: "start" },
       thread: args.thread,
     });

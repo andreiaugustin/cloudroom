@@ -25,7 +25,10 @@ import {
   countThreadStartsSent,
   startLiveHostCommand,
 } from "../hosts/live-command.js";
-import { getLastProviderThreadId } from "./thread-events.js";
+import {
+  getLastProviderThreadId,
+  getTurnRequestIdForTurn,
+} from "./thread-events.js";
 import { prepareCustomInstructionInput } from "./custom-instructions.js";
 import type { ThreadForkDescriptor } from "./thread-startup-store.js";
 import {
@@ -107,6 +110,9 @@ interface PrepareTurnSubmitCommandPayloadArgs {
   input: PromptInput[];
   inputGroups?: PromptInput[][];
   providerThreadId?: string;
+  /** The request this command will carry, when the caller already has it: provider env resolvers tie their login to
+   *  it. Omitted where the request id is only made later (it then gets none). */
+  requestId?: ClientTurnRequestId;
   target: TurnSubmitTarget;
   thread: Thread;
 }
@@ -271,6 +277,7 @@ export async function buildThreadStartCommand(
     thread: args.thread,
     environment: args.environment,
     model: args.execution.model,
+    turnRequest: { requestId: args.requestId },
   });
   const bridgeLaunch = requireBridgeLaunchForProviderId(deps, args.providerId);
   return {
@@ -359,6 +366,33 @@ export function addRequestIdToTurnSubmitCommandPayload(
   };
 }
 
+// The request this command carries, for provider env resolvers: "start" begins a provider turn, and "steer" or "auto"
+// aimed at a running turn joins it, named by a request that turn accepted. If that turn ended before the command
+// lands, the daemon starts a new one on the env resolved now (for a steer as for "auto"); the resolver still ties the
+// request to the turn it named, which ran on the same login unless the thread's account changed during that turn.
+// "auto" with no turn named may do either, and a turn that names no request is unknown: neither gets a running request.
+function turnRequestFor(
+  deps: LoggedWorkSessionDeps,
+  args: PrepareTurnSubmitCommandPayloadArgs,
+): { turnRequest?: { requestId: string; runningTurnRequestId?: string } } {
+  if (args.requestId === undefined) return {};
+  if (args.target.mode === "start")
+    return { turnRequest: { requestId: args.requestId } };
+  if (args.target.expectedTurnId === null) return {};
+  const running = getTurnRequestIdForTurn(deps, {
+    threadId: args.thread.id,
+    turnId: args.target.expectedTurnId,
+  });
+  return running === null
+    ? {}
+    : {
+        turnRequest: {
+          requestId: args.requestId,
+          runningTurnRequestId: running,
+        },
+      };
+}
+
 export async function prepareTurnSubmitCommandPayload(
   deps: LoggedWorkSessionDeps,
   args: PrepareTurnSubmitCommandPayloadArgs,
@@ -372,6 +406,7 @@ export async function prepareTurnSubmitCommandPayload(
     thread: args.thread,
     environment: args.environment,
     model: args.execution.model,
+    ...turnRequestFor(deps, args),
   });
   return buildPreparedTurnSubmitCommandPayload({
     deps,
